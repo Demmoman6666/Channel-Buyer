@@ -4,6 +4,7 @@ import bodyParser from 'body-parser';
 import { ensureDefaultUser, prisma } from './db';
 import { env } from './env';
 import { ethers } from 'ethers';
+import { tradeForChannelSlug } from './trade/pulsex';
 
 const ERC20_ABI = ['function balanceOf(address) view returns (uint256)'];
 
@@ -21,9 +22,9 @@ async function holderGateByWallet(addressToCheck: string) {
   const app = express();
   app.use(bodyParser.json());
 
-  // Auth
+  // Auth (accept header OR ?api_key= for browser friendliness)
   app.use(async (req, res, next) => {
-    const key = String(req.headers['x-api-key'] || '');
+    const key = String(req.headers['x-api-key'] || req.query.api_key || '');
     if (!key || key !== env.API_KEY) return res.status(401).json({ error: 'unauthorized' });
     const user = await prisma.user.findUnique({ where: { apiKey: env.API_KEY } });
     (req as any).user = user;
@@ -75,7 +76,7 @@ async function holderGateByWallet(addressToCheck: string) {
     res.json(p);
   });
 
-  // Add channel
+  // Add channel (MTPROTO/listener-neutral)
   app.post('/channels', async (req, res) => {
     const user = (req as any).user;
     const { slug, mode, buyProfileId } = req.body || {};
@@ -87,14 +88,10 @@ async function holderGateByWallet(addressToCheck: string) {
 
     if (!(await holderGateByWallet(p.wallet.address))) return res.status(402).json({ error: 'holder requirement not met' });
 
-    // emulate upsert with composite unique
     const existing = await prisma.channel.findFirst({ where: { userId: user.id, slug: slug.toLowerCase() } });
     let ch;
-    if (existing) {
-      ch = await prisma.channel.update({ where: { id: existing.id }, data: { buyProfileId: p.id, active: true } });
-    } else {
-      ch = await prisma.channel.create({ data: { userId: user.id, slug: slug.toLowerCase(), mode: 'MTPROTO', buyProfileId: p.id } });
-    }
+    if (existing) ch = await prisma.channel.update({ where: { id: existing.id }, data: { buyProfileId: p.id, active: true } });
+    else ch = await prisma.channel.create({ data: { userId: user.id, slug: slug.toLowerCase(), mode: 'MTPROTO', buyProfileId: p.id } });
     res.json(ch);
   });
 
@@ -105,7 +102,7 @@ async function holderGateByWallet(addressToCheck: string) {
     res.json(list);
   });
 
-  // Toggle by slug
+  // Toggle channel
   app.post('/channels/toggleBySlug', async (req, res) => {
     const user = (req as any).user;
     const { slug, active } = req.body || {};
@@ -129,7 +126,7 @@ async function holderGateByWallet(addressToCheck: string) {
     res.json({ dryRun: up.dryRun });
   });
 
-  // Status view
+  // Status
   app.get('/profiles/:id/status', async (req, res) => {
     const user = (req as any).user;
     const id = String(req.params.id);
@@ -144,6 +141,17 @@ async function holderGateByWallet(addressToCheck: string) {
       feeBps: p.feeBps,
       treasury: p.treasury
     });
+  });
+
+  // NEW: manual trade trigger (used by the bot when it sees a CA in a channel it’s in)
+  app.post('/trade/execute', async (req, res) => {
+    const user = (req as any).user;
+    const { slug, token } = req.body || {};
+    if (!slug || !token) return res.status(400).json({ error: 'slug and token required' });
+    const ch = await prisma.channel.findFirst({ where: { userId: user.id, slug: slug.toLowerCase(), active: true } });
+    if (!ch) return res.status(404).json({ error: 'channel not found or inactive' });
+    const result = await tradeForChannelSlug(slug, token);
+    res.json({ result });
   });
 
   app.listen(env.PORT, () => console.log(`API up on :${env.PORT}`));
