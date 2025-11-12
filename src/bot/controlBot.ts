@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import TelegramBot, { InlineKeyboardMarkup } from 'node-telegram-bot-api';
+import TelegramBot, { InlineKeyboardMarkup, Message, CallbackQuery } from 'node-telegram-bot-api';
 import axios from 'axios';
 import { env } from '../env';
 
@@ -28,7 +28,7 @@ async function apiGet(path: string) {
   return data;
 }
 
-bot.onText(/^\/start$/, (msg) => {
+bot.onText(/^\/start$/, (msg: Message) => {
   bot.sendMessage(msg.chat.id,
 `Welcome! Commands:
 /add <t.me/slug|@slug> userbot <profileId>
@@ -38,21 +38,24 @@ bot.onText(/^\/start$/, (msg) => {
 });
 
 // Add channel
-bot.onText(/^\/add\s+([^\s]+)\s+(userbot)\s+([\w-]+)/i, async (msg, m) => {
-  const chatId = msg.chat.id;
-  try {
-    const slug = parseSlug(m[1]);
-    const mode = 'MTPROTO';
-    const buyProfileId = m[3];
-    const ch = await apiPost('/channels', { slug, mode, buyProfileId });
-    bot.sendMessage(chatId, `✅ Added ${slug} (mode=${mode}) with profile=${buyProfileId}`);
-  } catch (e: any) {
-    bot.sendMessage(chatId, `❌ /add failed: ${e.response?.data?.error || e.message}`);
+bot.onText(/^\/add\s+([^\s]+)\s+(userbot)\s+([\w-]+)/i,
+  async (msg: Message, m: RegExpExecArray | null) => {
+    const chatId = msg.chat.id;
+    try {
+      if (!m) throw new Error('Bad args');
+      const slug = parseSlug(m[1]);
+      const mode = 'MTPROTO';
+      const buyProfileId = m[3];
+      const ch = await apiPost('/channels', { slug, mode, buyProfileId });
+      bot.sendMessage(chatId, `✅ Added ${slug} (mode=${mode}) with profile=${buyProfileId}`);
+    } catch (e: any) {
+      bot.sendMessage(chatId, `❌ /add failed: ${e.response?.data?.error || e.message}`);
+    }
   }
-});
+);
 
 // List channels
-bot.onText(/^\/list$/i, async (msg) => {
+bot.onText(/^\/list$/i, async (msg: Message) => {
   try {
     const list = await apiGet('/channels/list');
     if (!Array.isArray(list) || list.length === 0) return bot.sendMessage(msg.chat.id, 'No channels configured.');
@@ -64,8 +67,9 @@ bot.onText(/^\/list$/i, async (msg) => {
 });
 
 // Remove (disable) channel
-bot.onText(/^\/remove\s+([^\s]+)/i, async (msg, m) => {
+bot.onText(/^\/remove\s+([^\s]+)/i, async (msg: Message, m: RegExpExecArray | null) => {
   try {
+    if (!m) throw new Error('Bad args');
     const slug = parseSlug(m[1]);
     await apiPost('/channels/toggleBySlug', { slug, active: false });
     bot.sendMessage(msg.chat.id, `🛑 Disabled ${slug}`);
@@ -75,8 +79,9 @@ bot.onText(/^\/remove\s+([^\s]+)/i, async (msg, m) => {
 });
 
 // Status with buttons
-bot.onText(/^\/status\s+([\w-]+)/i, async (msg, m) => {
-  const profileId = m[1];
+bot.onText(/^\/status\s+([\w-]+)/i, async (msg: Message, m: RegExpExecArray | null) => {
+  const profileId = m?.[1];
+  if (!profileId) return bot.sendMessage(msg.chat.id, 'Usage: /status <profileId>');
   try {
     const st = await apiGet(`/profiles/${profileId}/status`);
     const kb: InlineKeyboardMarkup = {
@@ -99,7 +104,7 @@ Treasury: ${st.treasury || '(not set)'}`;
 });
 
 // Callbacks for toggle/refresh
-bot.on('callback_query', async (q) => {
+bot.on('callback_query', async (q: CallbackQuery) => {
   try {
     const data = q.data || '';
     if (data.startsWith('TOGGLE:')) {
