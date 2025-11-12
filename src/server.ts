@@ -5,6 +5,8 @@ import { ensureDefaultUser, prisma } from './db';
 import { env } from './env';
 import { ethers } from 'ethers';
 import { tradeForChannelSlug } from './trade/pulsex';
+import { TelegramClient, Api } from 'telegram';
+import { StringSession } from 'telegram/sessions';
 
 const ERC20_ABI = ['function balanceOf(address) view returns (uint256)'];
 
