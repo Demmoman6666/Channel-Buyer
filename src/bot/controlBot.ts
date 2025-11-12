@@ -4,19 +4,24 @@ import axios from 'axios';
 import { env } from '../env';
 
 const TOKEN = env.TELEGRAM_BOT_TOKEN;
-if (!TOKEN) {
-  console.error('TELEGRAM_BOT_TOKEN missing'); process.exit(1);
-}
+if (!TOKEN) { console.error('TELEGRAM_BOT_TOKEN missing'); process.exit(1); }
 const API = `http://localhost:${env.PORT}`;
+const DEFAULT_ROUTER = process.env.DEFAULT_ROUTER || '';
+const DEFAULT_WPLS   = process.env.DEFAULT_WPLS || '';
 
 const bot = new TelegramBot(TOKEN, { polling: true });
 
 function parseSlug(input: string) {
-  return input.trim()
-    .replace(/^https?:\/\//, '')
-    .replace(/^t\.me\//i, '')
-    .replace(/^@/, '')
-    .toLowerCase();
+  return input.trim().replace(/^https?:\/\//, '').replace(/^t\.me\//i, '').replace(/^@/, '').toLowerCase();
+}
+function slugFromChat(c: Message['chat']) {
+  return ((c as any).username || c.title || '').toLowerCase();
+}
+function extractAddrs(text = ''): string[] {
+  const set = new Set<string>();
+  const re = /(0x[a-fA-F0-9]{40})/g;
+  for (const m of text.matchAll(re)) set.add(m[1]);
+  return [...set];
 }
 
 async function apiPost(path: string, body: any) {
@@ -31,30 +36,57 @@ async function apiGet(path: string) {
 bot.onText(/^\/start$/, (msg: Message) => {
   bot.sendMessage(msg.chat.id,
 `Welcome! Commands:
+/wallet <0xaddress>
+/profile <walletId> <amountPLS> <slippageBps>
 /add <t.me/slug|@slug> userbot <profileId>
 /list
 /remove <slug>
-/status <profileId>`);
+/status <profileId>
+
+If you add this bot to a channel/group, it will auto-read posts there.
+`);
 });
 
-// Add channel
-bot.onText(/^\/add\s+([^\s]+)\s+(userbot)\s+([\w-]+)/i,
-  async (msg: Message, m: RegExpExecArray | null) => {
-    const chatId = msg.chat.id;
-    try {
-      if (!m) throw new Error('Bad args');
-      const slug = parseSlug(m[1]);
-      const mode = 'MTPROTO';
-      const buyProfileId = m[3];
-      const ch = await apiPost('/channels', { slug, mode, buyProfileId });
-      bot.sendMessage(chatId, `✅ Added ${slug} (mode=${mode}) with profile=${buyProfileId}`);
-    } catch (e: any) {
-      bot.sendMessage(chatId, `❌ /add failed: ${e.response?.data?.error || e.message}`);
-    }
+// Create wallet (returns walletId)
+bot.onText(/^\/wallet\s+(0x[a-fA-F0-9]{40})$/, async (msg: Message, m) => {
+  try {
+    const w = await apiPost('/wallets', { address: m[1], chainId: env.CHAIN_ID, label: 'bot' });
+    bot.sendMessage(msg.chat.id, `✅ Wallet saved.\nID: ${w.id}\nAddr: ${w.address}`);
+  } catch (e: any) {
+    bot.sendMessage(msg.chat.id, `❌ /wallet failed: ${e.response?.data?.error || e.message}`);
   }
-);
+});
 
-// List channels
+// Create profile (uses DEFAULT_ROUTER/DEFAULT_WPLS if set)
+bot.onText(/^\/profile\s+([\w-]+)\s+([\d.]+)\s+(\d{2,5})$/, async (msg: Message, m) => {
+  try {
+    const walletId = m[1];
+    const amountNative = Number(m[2]);
+    const slippageBps = Number(m[3]);
+    const router = DEFAULT_ROUTER;
+    const wrappedNative = DEFAULT_WPLS;
+    if (!router || !wrappedNative) return bot.sendMessage(msg.chat.id, '❌ DEFAULT_ROUTER/DEFAULT_WPLS not set in env.');
+    const p = await apiPost('/profiles', { walletId, amountNative, slippageBps, router, wrappedNative, treasury: process.env.TREASURY_ADDRESS });
+    bot.sendMessage(msg.chat.id, `✅ Profile created.\nID: ${p.id}\nAmount: ${p.amountNative} PLS\nSlip: ${p.slippageBps} bps`);
+  } catch (e: any) {
+    bot.sendMessage(msg.chat.id, `❌ /profile failed: ${e.response?.data?.error || e.message}`);
+  }
+});
+
+// Existing commands
+bot.onText(/^\/add\s+([^\s]+)\s+(userbot)\s+([\w-]+)/i, async (msg: Message, m) => {
+  const chatId = msg.chat.id;
+  try {
+    const slug = parseSlug(m[1]);
+    const mode = 'MTPROTO';
+    const buyProfileId = m[3];
+    await apiPost('/channels', { slug, mode, buyProfileId });
+    bot.sendMessage(chatId, `✅ Added ${slug} (mode=${mode}) with profile=${buyProfileId}`);
+  } catch (e: any) {
+    bot.sendMessage(chatId, `❌ /add failed: ${e.response?.data?.error || e.message}`);
+  }
+});
+
 bot.onText(/^\/list$/i, async (msg: Message) => {
   try {
     const list = await apiGet('/channels/list');
@@ -66,10 +98,8 @@ bot.onText(/^\/list$/i, async (msg: Message) => {
   }
 });
 
-// Remove (disable) channel
-bot.onText(/^\/remove\s+([^\s]+)/i, async (msg: Message, m: RegExpExecArray | null) => {
+bot.onText(/^\/remove\s+([^\s]+)/i, async (msg: Message, m) => {
   try {
-    if (!m) throw new Error('Bad args');
     const slug = parseSlug(m[1]);
     await apiPost('/channels/toggleBySlug', { slug, active: false });
     bot.sendMessage(msg.chat.id, `🛑 Disabled ${slug}`);
@@ -79,7 +109,7 @@ bot.onText(/^\/remove\s+([^\s]+)/i, async (msg: Message, m: RegExpExecArray | nu
 });
 
 // Status with buttons
-bot.onText(/^\/status\s+([\w-]+)/i, async (msg: Message, m: RegExpExecArray | null) => {
+bot.onText(/^\/status\s+([\w-]+)/i, async (msg: Message, m) => {
   const profileId = m?.[1];
   if (!profileId) return bot.sendMessage(msg.chat.id, 'Usage: /status <profileId>');
   try {
@@ -121,4 +151,30 @@ bot.on('callback_query', async (q: CallbackQuery) => {
   }
 });
 
-console.log('Control bot ready. Use /add @slug userbot <profileId> and /status <profileId>.');
+// NEW: auto-listen to posts in channels/groups where this bot is added
+bot.on('channel_post', async (msg: Message) => {
+  try {
+    const slug = slugFromChat(msg.chat);
+    const text = (msg.text || msg.caption || '').toString();
+    const [token] = extractAddrs(text);
+    if (!slug || !token) return;
+    await apiPost('/trade/execute', { slug, token });
+  } catch (e) {
+    console.error('[channel_post] error', e);
+  }
+});
+bot.on('message', async (msg: Message) => {
+  // groups/supergroups
+  if (!['group', 'supergroup'].includes(msg.chat.type)) return;
+  try {
+    const slug = slugFromChat(msg.chat);
+    const text = (msg.text || msg.caption || '').toString();
+    const [token] = extractAddrs(text);
+    if (!slug || !token) return;
+    await apiPost('/trade/execute', { slug, token });
+  } catch (e) {
+    console.error('[message] error', e);
+  }
+});
+
+console.log('Control bot ready. Add it to your channel/group to auto-buy; DM /wallet, /profile, /add, /status to manage.');
