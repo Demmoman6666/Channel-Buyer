@@ -1,0 +1,80 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id          String      @id @default(cuid())
+  createdAt   DateTime    @default(now())
+  telegramId  String?     @unique
+  username    String?
+  apiKey      String      @unique
+  wallets     Wallet[]
+  channels    Channel[]
+  buyProfiles BuyProfile[]
+}
+
+model Wallet {
+  id         String   @id @default(cuid())
+  user       User     @relation(fields: [userId], references: [id])
+  userId     String
+  address    String   @unique
+  encPrivKey String?
+  chainId    Int
+  label      String?
+  createdAt  DateTime @default(now())
+  profiles   BuyProfile[]
+}
+
+model Channel {
+  id            String      @id @default(cuid())
+  user          User        @relation(fields: [userId], references: [id])
+  userId        String
+  slug          String
+  mode          ChannelMode
+  active        Boolean     @default(true)
+  buyProfile    BuyProfile? @relation(fields: [buyProfileId], references: [id])
+  buyProfileId  String?
+  createdAt     DateTime    @default(now())
+
+  @@unique([userId, slug], name: "user_slug_unique")
+}
+
+model BuyProfile {
+  id                      String   @id @default(cuid())
+  user                    User     @relation(fields: [userId], references: [id])
+  userId                  String
+  wallet                  Wallet   @relation(fields: [walletId], references: [id])
+  walletId                String
+  amountNative            Float
+  slippageBps             Int
+  minSecondsBetweenBuys   Int      @default(900)
+  denyWords               String
+  keywords                String
+  router                  String
+  wrappedNative           String
+  feeBps                  Int      @default(100)
+  treasury                String?
+  dryRun                  Boolean  @default(true)
+  createdAt               DateTime @default(now())
+  channels                Channel[]
+}
+
+model TradeLog {
+  id        String   @id @default(cuid())
+  userId    String
+  channelId String
+  token     String
+  txHash    String?
+  status    String
+  reason    String?
+  createdAt DateTime @default(now())
+}
+
+enum ChannelMode {
+  MTPROTO
+}
