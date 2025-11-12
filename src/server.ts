@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import express from 'express';
+import express, { Request, Response, NextFunction } from 'express';
 import bodyParser from 'body-parser';
 import { ensureDefaultUser, prisma } from './db';
 import { env } from './env';
@@ -24,17 +24,17 @@ async function holderGateByWallet(addressToCheck: string) {
   const app = express();
   app.use(bodyParser.json());
 
-  // Auth (accept header OR ?api_key= for browser friendliness)
-  app.use(async (req, res, next) => {
-    const key = String(req.headers['x-api-key'] || req.query.api_key || '');
+  // ---------- Auth (accept header OR ?api_key= for browser friendliness)
+  app.use(async (req: Request, res: Response, next: NextFunction) => {
+    const key = String((req.headers['x-api-key'] as string) || (req.query.api_key as string) || '');
     if (!key || key !== env.API_KEY) return res.status(401).json({ error: 'unauthorized' });
     const user = await prisma.user.findUnique({ where: { apiKey: env.API_KEY } });
     (req as any).user = user;
     next();
   });
 
-  // Create wallet
-  app.post('/wallets', async (req, res) => {
+  // ---------- Create wallet
+  app.post('/wallets', async (req: Request, res: Response) => {
     const user = (req as any).user;
     const { address, chainId = env.CHAIN_ID, label } = req.body || {};
     if (!address) return res.status(400).json({ error: 'address required' });
@@ -45,10 +45,21 @@ async function holderGateByWallet(addressToCheck: string) {
     res.json(w);
   });
 
-  // Create buy profile
-  app.post('/profiles', async (req, res) => {
+  // ---------- Create buy profile
+  app.post('/profiles', async (req: Request, res: Response) => {
     const user = (req as any).user;
-    const { walletId, amountNative, slippageBps, denyWords, keywords, router, wrappedNative, feeBps, treasury, dryRun } = req.body || {};
+    const {
+      walletId,
+      amountNative,
+      slippageBps,
+      denyWords,
+      keywords,
+      router,
+      wrappedNative,
+      feeBps,
+      treasury,
+      dryRun
+    } = req.body || {};
 
     if (!walletId || amountNative == null || !slippageBps || !router || !wrappedNative) {
       return res.status(400).json({ error: 'walletId, amountNative, slippageBps, router, wrappedNative required' });
@@ -70,7 +81,7 @@ async function holderGateByWallet(addressToCheck: string) {
         keywords: keywords || 'buy,ca,contract,token,launch,shill,coin',
         router,
         wrappedNative,
-        feeBps: feeBps ?? 100,
+        feeBps: feeBps ?? 100, // 1% fee default
         treasury: treasury || process.env.TREASURY_ADDRESS || null,
         dryRun: dryRun ?? true
       }
@@ -78,8 +89,8 @@ async function holderGateByWallet(addressToCheck: string) {
     res.json(p);
   });
 
-  // Add channel (MTPROTO/listener-neutral)
-  app.post('/channels', async (req, res) => {
+  // ---------- Add channel (MTPROTO/listener-neutral)
+  app.post('/channels', async (req: Request, res: Response) => {
     const user = (req as any).user;
     const { slug, mode, buyProfileId } = req.body || {};
     if (!slug || !buyProfileId) return res.status(400).json({ error: 'slug and buyProfileId required' });
@@ -97,15 +108,15 @@ async function holderGateByWallet(addressToCheck: string) {
     res.json(ch);
   });
 
-  // List channels
-  app.get('/channels/list', async (req, res) => {
+  // ---------- List channels
+  app.get('/channels/list', async (req: Request, res: Response) => {
     const user = (req as any).user;
     const list = await prisma.channel.findMany({ where: { userId: user.id } });
     res.json(list);
   });
 
-  // Toggle channel
-  app.post('/channels/toggleBySlug', async (req, res) => {
+  // ---------- Toggle channel
+  app.post('/channels/toggleBySlug', async (req: Request, res: Response) => {
     const user = (req as any).user;
     const { slug, active } = req.body || {};
     if (!slug) return res.status(400).json({ error: 'slug required' });
@@ -115,8 +126,8 @@ async function holderGateByWallet(addressToCheck: string) {
     res.json(updated);
   });
 
-  // Toggle dryRun
-  app.post('/profiles/:id/dryrun', async (req, res) => {
+  // ---------- Toggle dryRun
+  app.post('/profiles/:id/dryrun', async (req: Request, res: Response) => {
     const user = (req as any).user;
     const id = String(req.params.id);
     const { toggle, dryRun } = req.body || {};
@@ -128,8 +139,8 @@ async function holderGateByWallet(addressToCheck: string) {
     res.json({ dryRun: up.dryRun });
   });
 
-  // Status
-  app.get('/profiles/:id/status', async (req, res) => {
+  // ---------- Status
+  app.get('/profiles/:id/status', async (req: Request, res: Response) => {
     const user = (req as any).user;
     const id = String(req.params.id);
     const p = await prisma.buyProfile.findUnique({ where: { id }, include: { wallet: true } });
@@ -145,8 +156,8 @@ async function holderGateByWallet(addressToCheck: string) {
     });
   });
 
-  // NEW: manual trade trigger (used by the bot when it sees a CA in a channel it’s in)
-  app.post('/trade/execute', async (req, res) => {
+  // ---------- Manual trade trigger (used by bots/userbot when they see a CA)
+  app.post('/trade/execute', async (req: Request, res: Response) => {
     const user = (req as any).user;
     const { slug, token } = req.body || {};
     if (!slug || !token) return res.status(400).json({ error: 'slug and token required' });
@@ -156,5 +167,96 @@ async function holderGateByWallet(addressToCheck: string) {
     res.json({ result });
   });
 
+  // =====================================================
+  // TG SESSION WEB FLOW (no terminal): /tg-session + APIs
+  // =====================================================
+  app.get('/tg-session', (_req: Request, res: Response) => {
+    res.type('html').send(`
+<!doctype html><meta name=viewport content="width=device-width,initial-scale=1"><title>TG Session</title>
+<style>body{font-family:system-ui,Arial;margin:20px;max-width:760px}label{display:block;margin:.6rem 0 .2rem}input{width:100%;padding:.5rem}button{margin-top:.8rem;padding:.6rem 1rem}pre{white-space:pre-wrap;background:#f5f5f7;padding:10px;border-radius:8px}</style>
+<h2>Generate Telegram TG_SESSION</h2>
+<p>Step 1: enter phone and click “Send Code”.<br>Step 2: enter the 5-digit code you receive (and 2FA password if you use it), then “Sign In”.</p>
+<label>Phone (e.g. +447...)</label><input id=phone placeholder="+447..." />
+<button id=send>Send Code</button>
+<div id=codeArea style="display:none">
+  <label>Code (5 digits)</label><input id=code placeholder="12345" />
+  <label>2FA Password (if enabled)</label><input id=pw placeholder="••••••" type=password />
+  <button id=signin>Sign In</button>
+</div>
+<h3>Session</h3>
+<pre id=out>(will appear here)</pre>
+<script>
+let phoneCodeHash = '';
+const get = (id)=>document.getElementById(id);
+get('send').onclick = async ()=>{
+  const r = await fetch('/api/tg/sendCode?api_key=${env.API_KEY}', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone:get('phone').value})});
+  const d = await r.json();
+  if(d.error){get('out').textContent='Error: '+d.error; return;}
+  phoneCodeHash = d.phoneCodeHash;
+  get('codeArea').style.display='block';
+  get('out').textContent='Code sent. Check Telegram.';
+};
+get('signin').onclick = async ()=>{
+  const r = await fetch('/api/tg/signIn?api_key=${env.API_KEY}', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+    phone:get('phone').value, code:get('code').value, phoneCodeHash, password:get('pw').value
+  })});
+  const d = await r.json();
+  if(d.error){get('out').textContent='Error: '+d.error; return;}
+  get('out').textContent=d.session || '(no session returned)';
+};
+</script>`);
+  });
+
+  app.post('/api/tg/sendCode', async (req: Request, res: Response) => {
+    try {
+      const { phone } = req.body || {};
+      if (!phone) return res.status(400).json({ error: 'phone required' });
+      const apiId = Number(process.env.TG_API_ID || 0);
+      const apiHash = String(process.env.TG_API_HASH || '');
+      if (!apiId || !apiHash) return res.status(500).json({ error: 'TG_API_ID/HASH not set on Core' });
+
+      const client = new TelegramClient(new StringSession(''), apiId, apiHash, { connectionRetries: 5 });
+      await client.connect();
+      const result = await client.invoke(new Api.auth.SendCode({
+        phoneNumber: phone,
+        apiId,
+        apiHash,
+        settings: new Api.CodeSettings({})
+      }));
+      await client.disconnect();
+      res.json({ phoneCodeHash: (result as any).phoneCodeHash });
+    } catch (e: any) {
+      res.status(500).json({ error: String(e?.message || e) });
+    }
+  });
+
+  app.post('/api/tg/signIn', async (req: Request, res: Response) => {
+    try {
+      const { phone, code, phoneCodeHash, password } = req.body || {};
+      const apiId = Number(process.env.TG_API_ID || 0);
+      const apiHash = String(process.env.TG_API_HASH || '');
+      if (!apiId || !apiHash) return res.status(500).json({ error: 'TG_API_ID/HASH not set on Core' });
+
+      const client = new TelegramClient(new StringSession(''), apiId, apiHash, { connectionRetries: 5 });
+      await client.connect();
+      try {
+        await client.invoke(new Api.auth.SignIn({ phoneNumber: phone, phoneCodeHash, phoneCode: code }));
+      } catch (err: any) {
+        if (String(err?.message || '').includes('SESSION_PASSWORD_NEEDED')) {
+          if (!password) throw new Error('2FA enabled: supply password');
+          await client.checkPassword(password);
+        } else {
+          throw err;
+        }
+      }
+      const session = client.session.save();
+      await client.disconnect();
+      res.json({ session });
+    } catch (e: any) {
+      res.status(500).json({ error: String(e?.message || e) });
+    }
+  });
+
+  // ---------- Listen
   app.listen(env.PORT, () => console.log(`API up on :${env.PORT}`));
 })();
