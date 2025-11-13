@@ -11,6 +11,7 @@ import { Buffer } from 'buffer';
 
 const ERC20_ABI = ['function balanceOf(address) view returns (uint256)'];
 
+// --------- holder gate (optional) ----------
 async function holderGateByWallet(addressToCheck: string) {
   if (!env.HOLDER_TOKEN_ADDRESS) return true;
   const provider = new ethers.JsonRpcProvider(env.EVM_RPC_URL, { chainId: env.CHAIN_ID, name: `chain-${env.CHAIN_ID}` });
@@ -25,13 +26,13 @@ async function holderGateByWallet(addressToCheck: string) {
   const app = express();
   app.use(bodyParser.json());
 
-  // Public paths (no API key): TG session helpers
-  const OPEN_PATHS = new Set([
+  // --- open endpoints (no api key) only for TG session helpers
+  const OPEN_PATHS = new Set<string>([
     '/tg-session', '/api/tg/sendCode', '/api/tg/signIn',
     '/tg-session-qr', '/api/tg/qr/start', '/api/tg/qr/poll'
   ]);
 
-  // API key auth for everything else
+  // --- auth middleware
   app.use(async (req: Request, res: Response, next: NextFunction) => {
     if (OPEN_PATHS.has(req.path)) return next();
     const key = String((req.headers['x-api-key'] as string) || (req.query.api_key as string) || '');
@@ -41,7 +42,7 @@ async function holderGateByWallet(addressToCheck: string) {
     next();
   });
 
-  // ---- Wallets / Profiles / Channels / Status ----
+  // --------- wallets / profiles / channels ----------
   app.post('/wallets', async (req, res) => {
     const user = (req as any).user;
     const { address, chainId = env.CHAIN_ID, label } = req.body || {};
@@ -60,7 +61,6 @@ async function holderGateByWallet(addressToCheck: string) {
     const wallet = await prisma.wallet.findUnique({ where: { id: walletId } });
     if (!wallet || wallet.userId !== user.id) return res.status(404).json({ error: 'wallet not found' });
     if (!(await holderGateByWallet(wallet.address))) return res.status(402).json({ error: 'holder requirement not met' });
-
     const p = await prisma.buyProfile.create({
       data: {
         userId: user.id,
@@ -119,7 +119,6 @@ async function holderGateByWallet(addressToCheck: string) {
     const { toggle, dryRun } = req.body || {};
     const p = await prisma.buyProfile.findUnique({ where: { id }, include: { wallet: true } });
     if (!p || p.userId !== user.id) return res.status(404).json({ error: 'profile not found' });
-
     const next = toggle ? !p.dryRun : !!dryRun;
     const up = await prisma.buyProfile.update({ where: { id }, data: { dryRun: next } });
     res.json({ dryRun: up.dryRun });
@@ -150,7 +149,7 @@ async function holderGateByWallet(addressToCheck: string) {
     res.json({ result });
   });
 
-  /* ===== Code login page (optional) ===== */
+  // --------- CODE LOGIN (fallback) ----------
   app.get('/tg-session', (_req, res) => {
     res.type('html').send(`
 <!doctype html><meta name=viewport content="width=device-width,initial-scale=1"><title>TG Session</title>
@@ -212,22 +211,22 @@ $('signin').onclick = async ()=>{
       } catch (err: any) {
         if (String(err?.message || '').includes('SESSION_PASSWORD_NEEDED')) {
           if (!password) throw new Error('2FA enabled: supply password');
+          // @ts-ignore gramJS helper not in d.ts
           await (client as any).checkPassword(password);
         } else {
           throw err;
         }
       }
-      const session = client.session.save();
+      const sessionStr = String(client.session.save()); // <- ensure string (no union/void)
       await client.disconnect();
-      res.json({ session });
+      res.json({ session: sessionStr });
     } catch (e: any) {
       res.status(500).json({ error: String(e?.message || e) });
     }
   });
 
-  /* ===== QR login (stateless) ===== */
-  const b64url = (buf: Buffer) =>
-    buf.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  // --------- QR LOGIN (stateless; Buffer everywhere) ----------
+  const b64url = (buf: Buffer) => buf.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 
   async function importTokenOnce(tokenBuf: Buffer): Promise<{ status: 'OK'|'WAITING'|'EXPIRED', session?: string }> {
     const apiId = Number(process.env.TG_API_ID || 0);
@@ -256,8 +255,8 @@ $('signin').onclick = async ()=>{
       }
 
       if (result && result.className === 'auth.loginTokenSuccess') {
-        const session = client.session.save();
-        return { status: 'OK', session };
+        const sessionStr = String(client.session.save()); // <- force string (fixes TS2322 paths)
+        return { status: 'OK', session: sessionStr };
       }
       return { status: 'WAITING' };
     } finally {
@@ -334,9 +333,9 @@ $('refresh').onclick = startQR;
       const exported: any = await client.invoke(new Api.auth.ExportLoginToken({ apiId, apiHash, exceptIds: [] }));
       try { await client.disconnect(); } catch {}
 
-      const raw = exported?.token as Buffer | Uint8Array;
+      const raw: any = exported?.token;
       if (!raw) return res.status(500).json({ error: 'Failed to export login token' });
-      const tokBuf: Buffer = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
+      const tokBuf: Buffer = Buffer.isBuffer(raw) ? raw : Buffer.from(raw as Uint8Array);
 
       return res.json({ tokenB64: b64url(tokBuf) });
     } catch (e: any) {
@@ -356,5 +355,6 @@ $('refresh').onclick = startQR;
     }
   });
 
+  // ---- boot
   app.listen(env.PORT, () => console.log(`API up on :${env.PORT}`));
 })();
