@@ -24,7 +24,7 @@ async function holderGateByWallet(addressToCheck: string) {
   const app = express();
   app.use(bodyParser.json());
 
-  // ---------- Auth (accept header OR ?api_key= for browser friendliness)
+  // Auth: header or ?api_key=
   app.use(async (req: Request, res: Response, next: NextFunction) => {
     const key = String((req.headers['x-api-key'] as string) || (req.query.api_key as string) || '');
     if (!key || key !== env.API_KEY) return res.status(401).json({ error: 'unauthorized' });
@@ -33,43 +33,24 @@ async function holderGateByWallet(addressToCheck: string) {
     next();
   });
 
-  // ---------- Create wallet
   app.post('/wallets', async (req: Request, res: Response) => {
     const user = (req as any).user;
     const { address, chainId = env.CHAIN_ID, label } = req.body || {};
     if (!address) return res.status(400).json({ error: 'address required' });
-
     if (!(await holderGateByWallet(address))) return res.status(402).json({ error: 'holder requirement not met' });
-
     const w = await prisma.wallet.create({ data: { userId: user.id, address, chainId, label } });
     res.json(w);
   });
 
-  // ---------- Create buy profile
   app.post('/profiles', async (req: Request, res: Response) => {
     const user = (req as any).user;
-    const {
-      walletId,
-      amountNative,
-      slippageBps,
-      denyWords,
-      keywords,
-      router,
-      wrappedNative,
-      feeBps,
-      treasury,
-      dryRun
-    } = req.body || {};
-
+    const { walletId, amountNative, slippageBps, denyWords, keywords, router, wrappedNative, feeBps, treasury, dryRun } = req.body || {};
     if (!walletId || amountNative == null || !slippageBps || !router || !wrappedNative) {
       return res.status(400).json({ error: 'walletId, amountNative, slippageBps, router, wrappedNative required' });
     }
-
     const wallet = await prisma.wallet.findUnique({ where: { id: walletId } });
     if (!wallet || wallet.userId !== user.id) return res.status(404).json({ error: 'wallet not found' });
-
     if (!(await holderGateByWallet(wallet.address))) return res.status(402).json({ error: 'holder requirement not met' });
-
     const p = await prisma.buyProfile.create({
       data: {
         userId: user.id,
@@ -81,7 +62,7 @@ async function holderGateByWallet(addressToCheck: string) {
         keywords: keywords || 'buy,ca,contract,token,launch,shill,coin',
         router,
         wrappedNative,
-        feeBps: feeBps ?? 100, // 1% fee default
+        feeBps: feeBps ?? 100,
         treasury: treasury || process.env.TREASURY_ADDRESS || null,
         dryRun: dryRun ?? true
       }
@@ -89,7 +70,6 @@ async function holderGateByWallet(addressToCheck: string) {
     res.json(p);
   });
 
-  // ---------- Add channel (MTPROTO/listener-neutral)
   app.post('/channels', async (req: Request, res: Response) => {
     const user = (req as any).user;
     const { slug, mode, buyProfileId } = req.body || {};
@@ -98,24 +78,21 @@ async function holderGateByWallet(addressToCheck: string) {
 
     const p = await prisma.buyProfile.findUnique({ where: { id: buyProfileId }, include: { wallet: true } });
     if (!p || p.userId !== user.id) return res.status(404).json({ error: 'profile not found' });
-
     if (!(await holderGateByWallet(p.wallet.address))) return res.status(402).json({ error: 'holder requirement not met' });
 
     const existing = await prisma.channel.findFirst({ where: { userId: user.id, slug: slug.toLowerCase() } });
-    let ch;
-    if (existing) ch = await prisma.channel.update({ where: { id: existing.id }, data: { buyProfileId: p.id, active: true } });
-    else ch = await prisma.channel.create({ data: { userId: user.id, slug: slug.toLowerCase(), mode: 'MTPROTO', buyProfileId: p.id } });
+    const ch = existing
+      ? await prisma.channel.update({ where: { id: existing.id }, data: { buyProfileId: p.id, active: true } })
+      : await prisma.channel.create({ data: { userId: user.id, slug: slug.toLowerCase(), mode: 'MTPROTO', buyProfileId: p.id } });
     res.json(ch);
   });
 
-  // ---------- List channels
   app.get('/channels/list', async (req: Request, res: Response) => {
     const user = (req as any).user;
     const list = await prisma.channel.findMany({ where: { userId: user.id } });
     res.json(list);
   });
 
-  // ---------- Toggle channel
   app.post('/channels/toggleBySlug', async (req: Request, res: Response) => {
     const user = (req as any).user;
     const { slug, active } = req.body || {};
@@ -126,26 +103,22 @@ async function holderGateByWallet(addressToCheck: string) {
     res.json(updated);
   });
 
-  // ---------- Toggle dryRun
   app.post('/profiles/:id/dryrun', async (req: Request, res: Response) => {
     const user = (req as any).user;
     const id = String(req.params.id);
     const { toggle, dryRun } = req.body || {};
     const p = await prisma.buyProfile.findUnique({ where: { id }, include: { wallet: true } });
     if (!p || p.userId !== user.id) return res.status(404).json({ error: 'profile not found' });
-
     const next = toggle ? !p.dryRun : !!dryRun;
     const up = await prisma.buyProfile.update({ where: { id }, data: { dryRun: next } });
     res.json({ dryRun: up.dryRun });
   });
 
-  // ---------- Status
   app.get('/profiles/:id/status', async (req: Request, res: Response) => {
     const user = (req as any).user;
     const id = String(req.params.id);
     const p = await prisma.buyProfile.findUnique({ where: { id }, include: { wallet: true } });
     if (!p || p.userId !== user.id) return res.status(404).json({ error: 'profile not found' });
-
     res.json({
       walletAddress: p.wallet.address,
       amountNative: p.amountNative,
@@ -156,7 +129,7 @@ async function holderGateByWallet(addressToCheck: string) {
     });
   });
 
-  // ---------- Manual trade trigger (used by bots/userbot when they see a CA)
+  // Manual trade trigger
   app.post('/trade/execute', async (req: Request, res: Response) => {
     const user = (req as any).user;
     const { slug, token } = req.body || {};
@@ -167,15 +140,12 @@ async function holderGateByWallet(addressToCheck: string) {
     res.json({ result });
   });
 
-  // =====================================================
-  // TG SESSION WEB FLOW (no terminal): /tg-session + APIs
-  // =====================================================
+  // ===== TG SESSION WEB FLOW (no terminal) =====
   app.get('/tg-session', (_req: Request, res: Response) => {
     res.type('html').send(`
 <!doctype html><meta name=viewport content="width=device-width,initial-scale=1"><title>TG Session</title>
 <style>body{font-family:system-ui,Arial;margin:20px;max-width:760px}label{display:block;margin:.6rem 0 .2rem}input{width:100%;padding:.5rem}button{margin-top:.8rem;padding:.6rem 1rem}pre{white-space:pre-wrap;background:#f5f5f7;padding:10px;border-radius:8px}</style>
 <h2>Generate Telegram TG_SESSION</h2>
-<p>Step 1: enter phone and click “Send Code”.<br>Step 2: enter the 5-digit code you receive (and 2FA password if you use it), then “Sign In”.</p>
 <label>Phone (e.g. +447...)</label><input id=phone placeholder="+447..." />
 <button id=send>Send Code</button>
 <div id=codeArea style="display:none">
@@ -244,7 +214,8 @@ get('signin').onclick = async ()=>{
       } catch (err: any) {
         if (String(err?.message || '').includes('SESSION_PASSWORD_NEEDED')) {
           if (!password) throw new Error('2FA enabled: supply password');
-          await client.checkPassword(password);
+          // gramJS has a helper but types don’t declare it — call via any
+          await (client as any).checkPassword(password);
         } else {
           throw err;
         }
@@ -257,6 +228,5 @@ get('signin').onclick = async ()=>{
     }
   });
 
-  // ---------- Listen
   app.listen(env.PORT, () => console.log(`API up on :${env.PORT}`));
 })();
