@@ -11,6 +11,7 @@ import { Buffer } from 'buffer';
 
 const ERC20_ABI = ['function balanceOf(address) view returns (uint256)'];
 
+// ---------- gating helper ----------
 async function holderGateByWallet(addressToCheck: string) {
   if (!env.HOLDER_TOKEN_ADDRESS) return true;
   const provider = new ethers.JsonRpcProvider(env.EVM_RPC_URL, { chainId: env.CHAIN_ID, name: `chain-${env.CHAIN_ID}` });
@@ -26,7 +27,7 @@ async function holderGateByWallet(addressToCheck: string) {
   app.use(bodyParser.json());
 
   // -----------------------------
-  // Auth allowlist (public helper pages are open)
+  // Auth with allowlist (open the TG helpers)
   // -----------------------------
   const OPEN_PATHS = new Set<string>([
     '/tg-session',
@@ -36,6 +37,7 @@ async function holderGateByWallet(addressToCheck: string) {
     '/api/tg/qr/start',
     '/api/tg/qr/poll',
     '/api/tg/qr/debug',
+    '/api/tg/qr/peek',
   ]);
 
   app.use(async (req: Request, res: Response, next: NextFunction) => {
@@ -68,7 +70,6 @@ async function holderGateByWallet(addressToCheck: string) {
     const wallet = await prisma.wallet.findUnique({ where: { id: walletId } });
     if (!wallet || wallet.userId !== user.id) return res.status(404).json({ error: 'wallet not found' });
     if (!(await holderGateByWallet(wallet.address))) return res.status(402).json({ error: 'holder requirement not met' });
-
     const p = await prisma.buyProfile.create({
       data: {
         userId: user.id,
@@ -82,8 +83,8 @@ async function holderGateByWallet(addressToCheck: string) {
         wrappedNative,
         feeBps: feeBps ?? 100, // 1%
         treasury: treasury || process.env.TREASURY_ADDRESS || null,
-        dryRun: dryRun ?? true,
-      },
+        dryRun: dryRun ?? true
+      }
     });
     res.json(p);
   });
@@ -149,12 +150,12 @@ async function holderGateByWallet(addressToCheck: string) {
       slippageBps: p.slippageBps,
       dryRun: p.dryRun,
       feeBps: p.feeBps,
-      treasury: p.treasury,
+      treasury: p.treasury
     });
   });
 
   // -----------------------------
-  // Manual trade trigger
+  // Manual trade trigger (for userbot)
   // -----------------------------
   app.post('/trade/execute', async (req: Request, res: Response) => {
     const user = (req as any).user;
@@ -167,7 +168,7 @@ async function holderGateByWallet(addressToCheck: string) {
   });
 
   // ======================================================
-  // TG SESSION via CODE (kept available)
+  // TG SESSION WEB FLOW — CODE login (kept)
   // ======================================================
   app.get('/tg-session', (_req: Request, res: Response) => {
     res.type('html').send(`
@@ -184,23 +185,16 @@ async function holderGateByWallet(addressToCheck: string) {
 <h3>Session</h3>
 <pre id=out>(will appear here)</pre>
 <script>
-let phoneCodeHash = '';
-const get = (id)=>document.getElementById(id);
-get('send').onclick = async ()=>{
-  const r = await fetch('/api/tg/sendCode?api_key=${env.API_KEY}', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone:get('phone').value})});
-  const d = await r.json();
-  if(d.error){get('out').textContent='Error: '+d.error; return;}
-  phoneCodeHash = d.phoneCodeHash;
-  get('codeArea').style.display='block';
-  get('out').textContent='Code sent. Check Telegram.';
+const $=(id)=>document.getElementById(id);
+let phoneCodeHash='';
+$('send').onclick=async()=>{
+  const r=await fetch('/api/tg/sendCode?api_key=${env.API_KEY}',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone:$('phone').value})});
+  const d=await r.json(); if(d.error){$('out').textContent='Error: '+d.error;return;}
+  phoneCodeHash=d.phoneCodeHash; $('codeArea').style.display='block'; $('out').textContent='Code sent.';
 };
-get('signin').onclick = async ()=>{
-  const r = await fetch('/api/tg/signIn?api_key=${env.API_KEY}', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
-    phone:get('phone').value, code:get('code').value, phoneCodeHash, password:get('pw').value
-  })});
-  const d = await r.json();
-  if(d.error){get('out').textContent='Error: '+d.error; return;}
-  get('out').textContent=d.session || '(no session returned)';
+$('signin').onclick=async()=>{
+  const r=await fetch('/api/tg/signIn?api_key=${env.API_KEY}',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone:$('phone').value,code:$('code').value,phoneCodeHash,password:$('pw').value})});
+  const d=await r.json(); $('out').textContent=d.error?('Error: '+d.error):(d.session||'(no session)');
 };
 </script>`);
   });
@@ -256,36 +250,21 @@ get('signin').onclick = async ()=>{
   });
 
   // ======================================================
-  // TG SESSION via QR — robust polling + debug
+  // TG SESSION via QR — now with on-page id & debug
   // ======================================================
   type QrState = {
     client: TelegramClient;
     token: Uint8Array;
     createdAt: number;
-    lastResult?: string;
+    lastResultClass?: string;
     lastError?: string;
-    polls: number;
   };
-
   const QR_STORE = new Map<string, QrState>();
-  const QR_TTL_MS = 65_000; // tokens are ~60s
+  const QR_TTL_MS = 2 * 60 * 1000;
 
-  function b64url(u8: Uint8Array) {
-    return Buffer.from(u8).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-  }
+  const b64url = (u8: Uint8Array) =>
+    Buffer.from(u8).toString('base64').replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
 
-  async function alreadyAuthorized(state: QrState): Promise<string | null> {
-    try {
-      await state.client.getMe(); // throws if not authorized
-      const session = state.client.session.save();
-      try { await state.client.disconnect(); } catch {}
-      return session || null;
-    } catch {
-      return null;
-    }
-  }
-
-  // QR page
   app.get('/tg-session-qr', (_req: Request, res: Response) => {
     res.type('html').send(`
 <!doctype html><meta name=viewport content="width=device-width,initial-scale=1"><title>TG Session (QR)</title>
@@ -295,71 +274,55 @@ get('signin').onclick = async ()=>{
   #qrbox{margin-top:12px;display:none}
   #qrbox img{width:240px;height:240px;border:1px solid #ddd;border-radius:8px}
   pre{white-space:pre-wrap;background:#f5f5f7;padding:10px;border-radius:8px}
-  #hint{color:#666}
+  #meta{margin-top:8px;color:#666}
 </style>
 <h2>Generate Telegram TG_SESSION (QR login)</h2>
 <ol>
   <li>Click <b>Start QR</b>. A QR appears.</li>
-  <li>On your phone open Telegram → <b>Settings → Devices → Link Desktop Device</b> and scan.<br>
-      (Or tap <b>Open in Telegram</b> to trigger the login inside the app.)</li>
+  <li>Telegram → <b>Settings → Devices → Link Desktop Device</b>, scan (or tap <i>Open in Telegram</i>).</li>
   <li>When linked, your <b>TG_SESSION</b> appears below.</li>
 </ol>
-<button id=start>Start QR</button>
+<button id=start>Start QR</button> <button id=refresh style="display:none">Refresh QR</button>
 <div id=qrbox>
-  <p>Scan with Telegram → Devices (<span id=timer>60</span>s left):</p>
+  <p>Scan with Telegram → Devices (<span id=ttl>–</span> left):</p>
   <img id=qr src="">
   <p><a id=deeplink href="#" target="_blank">Open in Telegram</a></p>
-  <p id=hint></p>
-  <button id=refresh style="margin-top:8px">Refresh QR</button>
+  <div id=meta>QR id: <code id=rid>—</code> · <a id=dlink target="_blank">Debug</a></div>
 </div>
 <h3>Session</h3>
 <pre id=out>(waiting…)</pre>
 <script>
-let id='', pollTimer=null, countdown=null, expiresAt=0;
 const $=(x)=>document.getElementById(x);
-
-async function start(){
-  clearTimeout(pollTimer); clearInterval(countdown);
+let id=''; let exp=0; let timer=null;
+function tick(){ const s=Math.max(0,Math.floor((exp-Date.now())/1000)); $('ttl').textContent=s+'s'; if(s<=0){ $('out').textContent='QR expired. Click "Refresh QR".'; clearInterval(timer); } }
+async function start(orRefresh=false){
   $('out').textContent='(waiting…)';
-  $('hint').textContent='';
-  const r = await fetch('/api/tg/qr/start');
-  const d = await r.json();
+  const r=await fetch('/api/tg/qr/start'); const d=await r.json();
   if(d.error){ $('out').textContent='Error: '+d.error; return; }
-  id = d.id;
-  const url = d.deeplink;
-  $('qr').src = 'https://api.qrserver.com/v1/create-qr-code/?size=240x240&data='+encodeURIComponent(url);
-  $('deeplink').href = url;
+  id=d.id; exp=Date.now()+d.expiresInSec*1000;
+  window.__qrId=id; console.log('QR id:', id);
+  $('qr').src='https://api.qrserver.com/v1/create-qr-code/?size=240x240&data='+encodeURIComponent(d.deeplink);
+  $('deeplink').href=d.deeplink;
+  $('rid').textContent=id;
+  $('dlink').href='/api/tg/qr/debug?id='+id;
   $('qrbox').style.display='block';
-  const ttl = (d.expiresInSec ?? 60) * 1000;
-  expiresAt = Date.now() + ttl;
-  updateTimer(); countdown = setInterval(updateTimer, 1000);
+  $('refresh').style.display='inline-block';
+  if(timer) clearInterval(timer); timer=setInterval(tick,1000);
   poll();
 }
-$('start').onclick = start;
-$('refresh').onclick = start;
-
-function updateTimer(){
-  const left = Math.max(0, Math.ceil((expiresAt - Date.now())/1000));
-  $('timer').textContent = left;
-  if(left === 0){ $('hint').textContent = 'QR expired. Click "Refresh QR" and scan again.'; }
-}
-
 async function poll(){
-  const r = await fetch('/api/tg/qr/poll', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ id }) });
-  const d = await r.json();
+  const r=await fetch('/api/tg/qr/poll',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});
+  const d=await r.json();
   if(d.error){ $('out').textContent='Error: '+d.error; return; }
-  if(d.session){ $('out').textContent = d.session; clearInterval(countdown); return; }
-  if(d.status==='EXPIRED'){ $('hint').textContent='QR expired. Click "Refresh QR".'; return; }
-  // WAITING: show debug crumbs if present
-  if(d.lastResult || d.lastError){
-    $('hint').textContent = (d.lastResult ? ('result: '+d.lastResult+' ') : '') + (d.lastError ? ('err: '+d.lastError) : '');
-  }
-  pollTimer = setTimeout(poll, 900);
+  if(d.session){ $('out').textContent=d.session; return; }
+  if(d.status==='EXPIRED'){ $('out').textContent='QR expired. Click "Refresh QR".'; return; }
+  setTimeout(poll, 1500);
 }
+$('start').onclick=()=>start(false);
+$('refresh').onclick=()=>start(true);
 </script>`);
   });
 
-  // Start QR
   app.get('/api/tg/qr/start', async (_req: Request, res: Response) => {
     try {
       const apiId = Number(process.env.TG_API_ID || 0);
@@ -370,69 +333,49 @@ async function poll(){
       await client.connect();
 
       const exported: any = await client.invoke(new Api.auth.ExportLoginToken({ apiId, apiHash, exceptIds: [] }));
-      if (!exported || !exported.token) {
-        await client.disconnect();
-        return res.status(500).json({ error: 'Failed to export login token' });
-      }
+      if (!exported || !exported.token) { await client.disconnect(); return res.status(500).json({ error: 'Failed to export login token' }); }
 
-      const raw = (exported as any).token as Uint8Array | Buffer;
-      const tokenU8 = raw instanceof Uint8Array ? raw : new Uint8Array(raw);
-
+      const tokenU8 = exported.token instanceof Uint8Array ? exported.token : new Uint8Array(exported.token);
       const id = Math.random().toString(36).slice(2);
-      QR_STORE.set(id, { client, token: tokenU8, createdAt: Date.now(), polls: 0 });
-      const deeplink = 'tg://login?token=' + b64url(tokenU8);
-      res.json({ id, deeplink, expiresInSec: 60 });
+      QR_STORE.set(id, { client, token: tokenU8, createdAt: Date.now() });
+
+      res.json({ id, deeplink: 'tg://login?token=' + b64url(tokenU8), expiresInSec: 60 });
     } catch (e: any) {
       res.status(500).json({ error: String(e?.message || e) });
     }
   });
 
-  // Poll QR
   app.post('/api/tg/qr/poll', async (req: Request, res: Response) => {
     try {
       const { id } = req.body || {};
       const state = QR_STORE.get(String(id));
       if (!state) return res.json({ status: 'EXPIRED' });
 
-      state.polls++;
-
-      // If token window passed: maybe already authorized?
+      // TTL expiry
       if (Date.now() - state.createdAt > QR_TTL_MS) {
-        const sess = await alreadyAuthorized(state);
-        if (sess) { QR_STORE.delete(String(id)); return res.json({ session: sess }); }
         try { await state.client.disconnect(); } catch {}
         QR_STORE.delete(String(id));
-        return res.json({ status: 'EXPIRED', lastResult: state.lastResult, lastError: state.lastError });
+        return res.json({ status: 'EXPIRED' });
       }
 
-      // First try: if already authorized, return session
-      const sessPre = await alreadyAuthorized(state);
-      if (sessPre) { QR_STORE.delete(String(id)); return res.json({ session: sessPre }); }
-
-      // Otherwise try to import the login token
+      // Try to import token
       try {
         const result: any = await state.client.invoke(new Api.auth.ImportLoginToken({ token: Buffer.from(state.token) }));
-        state.lastResult = result?.className || 'unknown';
+        state.lastResultClass = result?.className;
 
         if (result && result.className === 'auth.loginTokenMigrateTo') {
-          // DC migrate
+          // When Telegram asks to switch DC, do it and retry once.
           const dcId = (result as any).dcId;
-          if (typeof (state.client as any)._switchDC === 'function') {
-            await (state.client as any)._switchDC(dcId);
-          } else {
-            await state.client.disconnect();
-            await state.client.connect();
-          }
-          // Retry once after migration
-          const retry: any = await state.client.invoke(new Api.auth.ImportLoginToken({ token: Buffer.from(state.token) }));
-          state.lastResult = retry?.className || state.lastResult;
-          if (retry && retry.className === 'auth.loginTokenSuccess') {
+          if ((state.client as any)?.setDC) await (state.client as any).setDC(dcId);
+          await state.client.connect();
+          const result2: any = await state.client.invoke(new Api.auth.ImportLoginToken({ token: Buffer.from(state.token) }));
+          state.lastResultClass = result2?.className;
+          if (result2 && result2.className === 'auth.loginTokenSuccess') {
             const session = state.client.session.save();
             try { await state.client.disconnect(); } catch {}
             QR_STORE.delete(String(id));
             return res.json({ session });
           }
-          // If still not success, fall through to waiting
         }
 
         if (result && result.className === 'auth.loginTokenSuccess') {
@@ -442,38 +385,42 @@ async function poll(){
           return res.json({ session });
         }
 
-        // auth.loginToken = still waiting
-        return res.json({ status: 'WAITING', lastResult: state.lastResult });
-      } catch (e: any) {
-        const msg = String(e?.message || '');
+        // Not ready yet
+        return res.json({ status: 'WAITING' });
+      } catch (err: any) {
+        const msg = String(err?.message || err);
         state.lastError = msg;
+        // Treat token errors as expired so you can refresh quickly
         if (msg.includes('AUTH_TOKEN_EXPIRED') || msg.includes('AUTH_TOKEN_INVALID')) {
-          const sess = await alreadyAuthorized(state);
-          if (sess) { QR_STORE.delete(String(id)); return res.json({ session: sess }); }
           try { await state.client.disconnect(); } catch {}
           QR_STORE.delete(String(id));
-          return res.json({ status: 'EXPIRED', lastError: state.lastError });
+          return res.json({ status: 'EXPIRED' });
         }
-        // Other errors: keep waiting but report
-        return res.json({ status: 'WAITING', lastError: state.lastError });
+        // Otherwise keep waiting; frontend will poll again
+        return res.json({ status: 'WAITING' });
       }
     } catch (e: any) {
       res.status(500).json({ error: String(e?.message || e) });
     }
   });
 
-  // Optional: raw debug
+  // Handy: peek current id (first one) & debug details
+  app.get('/api/tg/qr/peek', (_req: Request, res: Response) => {
+    const [first] = Array.from(QR_STORE.keys());
+    res.json({ id: first || null });
+  });
+
   app.get('/api/tg/qr/debug', (req: Request, res: Response) => {
     const id = String(req.query.id || '');
-    const st = QR_STORE.get(id);
-    if (!st) return res.json({ exists: false });
+    const s = QR_STORE.get(id);
+    if (!s) return res.json({ exists: false });
     res.json({
       exists: true,
-      createdAt: st.createdAt,
-      ageMs: Date.now() - st.createdAt,
-      polls: st.polls,
-      lastResult: st.lastResult,
-      lastError: st.lastError,
+      id,
+      ageSec: Math.floor((Date.now() - s.createdAt) / 1000),
+      lastResultClass: s.lastResultClass || null,
+      lastError: s.lastError || null,
+      tokenLen: s.token?.length || 0
     });
   });
 
