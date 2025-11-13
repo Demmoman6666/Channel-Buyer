@@ -26,8 +26,7 @@ async function holderGateByWallet(addressToCheck: string) {
   app.use(bodyParser.json());
 
   // -----------------------------
-  // Auth (header OR ?api_key=),
-  // allowlist TG session helper routes (code + QR)
+  // Auth with allowlist (code + QR helpers are open)
   // -----------------------------
   const OPEN_PATHS = new Set<string>([
     '/tg-session',
@@ -134,6 +133,7 @@ async function holderGateByWallet(addressToCheck: string) {
     const { toggle, dryRun } = req.body || {};
     const p = await prisma.buyProfile.findUnique({ where: { id }, include: { wallet: true } });
     if (!p || p.userId !== user.id) return res.status(404).json({ error: 'profile not found' });
+
     const next = toggle ? !p.dryRun : !!dryRun;
     const up = await prisma.buyProfile.update({ where: { id }, data: { dryRun: next } });
     res.json({ dryRun: up.dryRun });
@@ -168,7 +168,7 @@ async function holderGateByWallet(addressToCheck: string) {
   });
 
   // ======================================================
-  // TG SESSION WEB FLOW — CODE (kept for completeness)
+  // TG SESSION WEB FLOW — CODE (kept available)
   // ======================================================
   app.get('/tg-session', (_req: Request, res: Response) => {
     res.type('html').send(`
@@ -243,7 +243,7 @@ get('signin').onclick = async ()=>{
       } catch (err: any) {
         if (String(err?.message || '').includes('SESSION_PASSWORD_NEEDED')) {
           if (!password) throw new Error('2FA enabled: supply password');
-          await (client as any).checkPassword(password); // helper exists; types don’t declare it
+          await (client as any).checkPassword(password); // types don't declare helper
         } else {
           throw err;
         }
@@ -257,22 +257,22 @@ get('signin').onclick = async ()=>{
   });
 
   // ======================================================
-  // TG SESSION via QR (no codes) — FIXED to use Buffer
+  // TG SESSION via QR (no codes) — use Uint8Array end-to-end
   // ======================================================
 
   type QrState = {
     client: TelegramClient;
-    token: Buffer;        // store as Buffer for type-safety
+    token: Uint8Array;   // <-- standardise on Uint8Array
     createdAt: number;
   };
   const QR_STORE = new Map<string, QrState>();
   const QR_TTL_MS = 2 * 60 * 1000; // 2 minutes
 
-  function b64url(buf: Buffer) {
-    return buf.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  function b64url(u8: Uint8Array) {
+    return Buffer.from(u8).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
   }
 
-  // HTML page for QR login
+  // QR page
   app.get('/tg-session-qr', (_req: Request, res: Response) => {
     res.type('html').send(`
 <!doctype html><meta name=viewport content="width=device-width,initial-scale=1"><title>TG Session (QR)</title>
@@ -302,28 +302,24 @@ get('start').onclick = async ()=>{
   const d = await r.json();
   if(d.error){ get('out').textContent='Error: '+d.error; return; }
   id = d.id;
-  const url = d.deeplink; // tg://login?token=...
+  const url = d.deeplink;
   get('qr').src = 'https://api.qrserver.com/v1/create-qr-code/?size=240x240&data='+encodeURIComponent(url);
   get('deeplink').href = url;
   get('qrbox').style.display='block';
   poll();
 };
-
 async function poll(){
   const r = await fetch('/api/tg/qr/poll', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ id }) });
   const d = await r.json();
   if(d.error){ get('out').textContent='Error: '+d.error; return; }
-  if(d.session){
-    get('out').textContent = d.session;
-    return;
-  }
+  if(d.session){ get('out').textContent = d.session; return; }
   if(d.status==='EXPIRED'){ get('out').textContent='QR expired. Click "Start QR" again.'; return; }
   setTimeout(poll, 2000);
 }
 </script>`);
   });
 
-  // Start QR login — returns a deep link token
+  // Start QR login
   app.get('/api/tg/qr/start', async (_req: Request, res: Response) => {
     try {
       const apiId = Number(process.env.TG_API_ID || 0);
@@ -334,23 +330,26 @@ async function poll(){
       await client.connect();
 
       const exported: any = await client.invoke(new Api.auth.ExportLoginToken({ apiId, apiHash, exceptIds: [] }));
-      if (!exported || !exported.token) { await client.disconnect(); return res.status(500).json({ error: 'Failed to export login token' }); }
+      if (!exported || !exported.token) {
+        await client.disconnect();
+        return res.status(500).json({ error: 'Failed to export login token' });
+      }
 
-      // Ensure Buffer type for token
-      const raw = (exported as any).token;
-      const tokenBuf: Buffer = Buffer.isBuffer(raw) ? raw as Buffer : Buffer.from(raw as Uint8Array);
+      // token may be Buffer or Uint8Array; normalise to Uint8Array
+      const raw = (exported as any).token as Uint8Array;
+      const tokenU8 = raw instanceof Uint8Array ? raw : new Uint8Array(raw);
 
       const id = Math.random().toString(36).slice(2);
-      QR_STORE.set(id, { client, token: tokenBuf, createdAt: Date.now() });
+      QR_STORE.set(id, { client, token: tokenU8, createdAt: Date.now() });
 
-      const deeplink = 'tg://login?token=' + b64url(tokenBuf);
+      const deeplink = 'tg://login?token=' + b64url(tokenU8);
       res.json({ id, deeplink, expiresInSec: 120 });
     } catch (e: any) {
       res.status(500).json({ error: String(e?.message || e) });
     }
   });
 
-  // Poll QR — once scanned/confirmed, returns TG_SESSION
+  // Poll QR
   app.post('/api/tg/qr/poll', async (req: Request, res: Response) => {
     try {
       const { id } = req.body || {};
@@ -363,10 +362,7 @@ async function poll(){
         return res.json({ status: 'EXPIRED' });
       }
 
-      // gramJS accepts Uint8Array; Buffer is a subclass, but cast to be explicit
-      const result: any = await state.client.invoke(new Api.auth.ImportLoginToken({
-        token: new Uint8Array(state.token)
-      }));
+      const result: any = await state.client.invoke(new Api.auth.ImportLoginToken({ token: state.token }));
 
       if (result && result.className === 'auth.loginTokenMigrateTo') {
         try { await state.client.disconnect(); } catch {}
