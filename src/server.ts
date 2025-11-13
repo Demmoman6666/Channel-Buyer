@@ -108,9 +108,9 @@ async function holderGateByWallet(addressToCheck: string) {
     res.json(ch);
   });
 
-  app.get('/channels/list', async (req: Request, res: Response) => {
-    const user = (req as any).user;
-    const list = await prisma.channel.findMany({ where: { userId: user.id } });
+  app.get('/channels/list', async (_req: Request, res: Response) => {
+    const user = ( _req as any).user;
+    const list = await prisma.channel.findMany({ where: { userId: user?.id } });
     res.json(list);
   });
 
@@ -257,12 +257,12 @@ get('signin').onclick = async ()=>{
   });
 
   // ======================================================
-  // TG SESSION via QR (no codes) — use Uint8Array end-to-end
+  // TG SESSION via QR (no codes)
   // ======================================================
 
   type QrState = {
     client: TelegramClient;
-    token: Uint8Array;   // <-- standardise on Uint8Array
+    token: Uint8Array;
     createdAt: number;
   };
   const QR_STORE = new Map<string, QrState>();
@@ -335,8 +335,7 @@ async function poll(){
         return res.status(500).json({ error: 'Failed to export login token' });
       }
 
-      // token may be Buffer or Uint8Array; normalise to Uint8Array
-      const raw = (exported as any).token as Uint8Array;
+      const raw = (exported as any).token as Uint8Array | Buffer;
       const tokenU8 = raw instanceof Uint8Array ? raw : new Uint8Array(raw);
 
       const id = Math.random().toString(36).slice(2);
@@ -349,7 +348,7 @@ async function poll(){
     }
   });
 
-  // Poll QR
+  // Poll QR — **amended to handle DC migrate + token expiry gracefully**
   app.post('/api/tg/qr/poll', async (req: Request, res: Response) => {
     try {
       const { id } = req.body || {};
@@ -362,14 +361,43 @@ async function poll(){
         return res.json({ status: 'EXPIRED' });
       }
 
-      const result: any = await state.client.invoke(
-  new Api.auth.ImportLoginToken({ token: Buffer.from(state.token) })
-);
+      let result: any;
+      try {
+        result = await state.client.invoke(
+          new Api.auth.ImportLoginToken({ token: Buffer.from(state.token) })
+        );
+      } catch (e: any) {
+        const msg = String(e?.message || '');
+        if (msg.includes('AUTH_TOKEN_EXPIRED') || msg.includes('AUTH_TOKEN_INVALID')) {
+          try { await state.client.disconnect(); } catch {}
+          QR_STORE.delete(String(id));
+          return res.json({ status: 'EXPIRED' });
+        }
+        throw e;
+      }
 
+      // Migration? switch DC once and retry
       if (result && result.className === 'auth.loginTokenMigrateTo') {
-        try { await state.client.disconnect(); } catch {}
-        QR_STORE.delete(String(id));
-        return res.json({ status: 'EXPIRED', note: 'DC migrate; start QR again' });
+        const dcId = (result as any).dcId;
+        if (typeof (state.client as any)._switchDC === 'function') {
+          await (state.client as any)._switchDC(dcId);
+        } else {
+          await state.client.disconnect();
+          await state.client.connect();
+        }
+        try {
+          result = await state.client.invoke(
+            new Api.auth.ImportLoginToken({ token: Buffer.from(state.token) })
+          );
+        } catch (e: any) {
+          const msg = String(e?.message || '');
+          if (msg.includes('AUTH_TOKEN_EXPIRED') || msg.includes('AUTH_TOKEN_INVALID')) {
+            try { await state.client.disconnect(); } catch {}
+            QR_STORE.delete(String(id));
+            return res.json({ status: 'EXPIRED' });
+          }
+          throw e;
+        }
       }
 
       if (result && result.className === 'auth.loginTokenSuccess') {
