@@ -362,7 +362,9 @@ async function poll(){
         return res.json({ status: 'EXPIRED' });
       }
 
-      const result: any = await state.client.invoke(new Api.auth.ImportLoginToken({ token: state.token }));
+      const result: any = await state.client.invoke(
+  new Api.auth.ImportLoginToken({ token: Buffer.from(state.token) })
+);
 
       if (result && result.className === 'auth.loginTokenMigrateTo') {
         try { await state.client.disconnect(); } catch {}
