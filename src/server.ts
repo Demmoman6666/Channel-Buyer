@@ -69,6 +69,7 @@ async function holderGateByWallet(addressToCheck: string) {
     const wallet = await prisma.wallet.findUnique({ where: { id: walletId } });
     if (!wallet || wallet.userId !== user.id) return res.status(404).json({ error: 'wallet not found' });
     if (!(await holderGateByWallet(wallet.address))) return res.status(402).json({ error: 'holder requirement not met' });
+
     const p = await prisma.buyProfile.create({
       data: {
         userId: user.id,
@@ -108,8 +109,8 @@ async function holderGateByWallet(addressToCheck: string) {
     res.json(ch);
   });
 
-  app.get('/channels/list', async (_req: Request, res: Response) => {
-    const user = ( _req as any).user;
+  app.get('/channels/list', async (req: Request, res: Response) => {
+    const user = (req as any).user;
     const list = await prisma.channel.findMany({ where: { userId: user?.id } });
     res.json(list);
   });
@@ -257,7 +258,7 @@ get('signin').onclick = async ()=>{
   });
 
   // ======================================================
-  // TG SESSION via QR (no codes)
+  // TG SESSION via QR (no codes) — auto-refresh & DC migrate handling
   // ======================================================
 
   type QrState = {
@@ -266,13 +267,13 @@ get('signin').onclick = async ()=>{
     createdAt: number;
   };
   const QR_STORE = new Map<string, QrState>();
-  const QR_TTL_MS = 2 * 60 * 1000; // 2 minutes
+  const QR_TTL_MS = 70_000; // ~60s real TTL + small buffer
 
   function b64url(u8: Uint8Array) {
     return Buffer.from(u8).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
   }
 
-  // QR page
+  // QR page (auto-refreshing)
   app.get('/tg-session-qr', (_req: Request, res: Response) => {
     res.type('html').send(`
 <!doctype html><meta name=viewport content="width=device-width,initial-scale=1"><title>TG Session (QR)</title>
@@ -286,35 +287,41 @@ get('signin').onclick = async ()=>{
 <h2>Generate Telegram TG_SESSION (QR login)</h2>
 <ol>
   <li>Click <b>Start QR</b>. A QR appears.</li>
-  <li>In Telegram: <b>Settings → Devices → Link Desktop Device</b> and scan.</li>
-  <li>When linked, your <b>TG_SESSION</b> appears below — copy it into Railway (Userbot).</li>
+  <li>In Telegram: <b>Settings → Devices → Link Desktop Device</b> and scan (or tap <i>Open in Telegram</i>).</li>
+  <li>When linked, your <b>TG_SESSION</b> appears below.</li>
 </ol>
 <button id=start>Start QR</button>
 <div id=qrbox><p>Scan with Telegram → Devices:</p><img id=qr src=""><p><a id=deeplink href="#" target="_blank">Open in Telegram</a></p></div>
 <h3>Session</h3>
 <pre id=out>(waiting…)</pre>
 <script>
-let id='';
-const get=(x)=>document.getElementById(x);
-get('start').onclick = async ()=>{
-  get('out').textContent='(waiting…)';
+let id='', refreshTimer=null, pollTimer=null, expiresAt=0;
+const $=(x)=>document.getElementById(x);
+async function start(){
+  clearInterval(refreshTimer); clearTimeout(pollTimer);
+  $('out').textContent='(waiting…)';
   const r = await fetch('/api/tg/qr/start');
   const d = await r.json();
-  if(d.error){ get('out').textContent='Error: '+d.error; return; }
+  if(d.error){ $('out').textContent='Error: '+d.error; return; }
   id = d.id;
   const url = d.deeplink;
-  get('qr').src = 'https://api.qrserver.com/v1/create-qr-code/?size=240x240&data='+encodeURIComponent(url);
-  get('deeplink').href = url;
-  get('qrbox').style.display='block';
+  $('qr').src = 'https://api.qrserver.com/v1/create-qr-code/?size=240x240&data='+encodeURIComponent(url);
+  $('deeplink').href = url;
+  $('qrbox').style.display='block';
+  const ttl = (d.expiresInSec ?? 60) * 1000;
+  expiresAt = Date.now() + ttl - 5000;
+  refreshTimer = setInterval(()=>{ if(Date.now()>expiresAt){ start(); } }, 1000);
   poll();
-};
+}
+$('start').onclick = start;
+
 async function poll(){
   const r = await fetch('/api/tg/qr/poll', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ id }) });
   const d = await r.json();
-  if(d.error){ get('out').textContent='Error: '+d.error; return; }
-  if(d.session){ get('out').textContent = d.session; return; }
-  if(d.status==='EXPIRED'){ get('out').textContent='QR expired. Click "Start QR" again.'; return; }
-  setTimeout(poll, 2000);
+  if(d.error){ $('out').textContent='Error: '+d.error; return; }
+  if(d.session){ $('out').textContent = d.session; clearInterval(refreshTimer); return; }
+  if(d.status==='EXPIRED'){ $('out').textContent='QR expired. Restarting…'; return start(); }
+  pollTimer = setTimeout(poll, 800);
 }
 </script>`);
   });
@@ -342,13 +349,13 @@ async function poll(){
       QR_STORE.set(id, { client, token: tokenU8, createdAt: Date.now() });
 
       const deeplink = 'tg://login?token=' + b64url(tokenU8);
-      res.json({ id, deeplink, expiresInSec: 120 });
+      res.json({ id, deeplink, expiresInSec: 60 });
     } catch (e: any) {
       res.status(500).json({ error: String(e?.message || e) });
     }
   });
 
-  // Poll QR — **amended to handle DC migrate + token expiry gracefully**
+  // Poll QR — handles DC migrate + token expiry gracefully
   app.post('/api/tg/qr/poll', async (req: Request, res: Response) => {
     try {
       const { id } = req.body || {};
