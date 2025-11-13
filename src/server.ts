@@ -169,7 +169,7 @@ async function holderGateByWallet(addressToCheck: string) {
   });
 
   // ======================================================
-  // TG SESSION WEB FLOW — CODE (kept available)
+  // TG SESSION via CODE (kept available)
   // ======================================================
   app.get('/tg-session', (_req: Request, res: Response) => {
     res.type('html').send(`
@@ -244,7 +244,7 @@ get('signin').onclick = async ()=>{
       } catch (err: any) {
         if (String(err?.message || '').includes('SESSION_PASSWORD_NEEDED')) {
           if (!password) throw new Error('2FA enabled: supply password');
-          await (client as any).checkPassword(password); // types don't declare helper
+          await (client as any).checkPassword(password); // helper not typed
         } else {
           throw err;
         }
@@ -258,7 +258,7 @@ get('signin').onclick = async ()=>{
   });
 
   // ======================================================
-  // TG SESSION via QR (no codes) — auto-refresh & DC migrate handling
+  // TG SESSION via QR (no auto-refresh; clear statuses)
   // ======================================================
 
   type QrState = {
@@ -267,13 +267,13 @@ get('signin').onclick = async ()=>{
     createdAt: number;
   };
   const QR_STORE = new Map<string, QrState>();
-  const QR_TTL_MS = 70_000; // ~60s real TTL + small buffer
+  const QR_TTL_MS = 65_000; // Telegram tokens live ~60s
 
   function b64url(u8: Uint8Array) {
     return Buffer.from(u8).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
   }
 
-  // QR page (auto-refreshing)
+  // QR page (stable — you control refresh)
   app.get('/tg-session-qr', (_req: Request, res: Response) => {
     res.type('html').send(`
 <!doctype html><meta name=viewport content="width=device-width,initial-scale=1"><title>TG Session (QR)</title>
@@ -283,23 +283,33 @@ get('signin').onclick = async ()=>{
   #qrbox{margin-top:12px;display:none}
   #qrbox img{width:240px;height:240px;border:1px solid #ddd;border-radius:8px}
   pre{white-space:pre-wrap;background:#f5f5f7;padding:10px;border-radius:8px}
+  #hint{color:#666}
 </style>
 <h2>Generate Telegram TG_SESSION (QR login)</h2>
 <ol>
   <li>Click <b>Start QR</b>. A QR appears.</li>
-  <li>In Telegram: <b>Settings → Devices → Link Desktop Device</b> and scan (or tap <i>Open in Telegram</i>).</li>
+  <li>On your phone open <b>Telegram → Settings → Devices → Link Desktop Device</b> and scan.<br>
+      (Or tap <i>Open in Telegram</i> to trigger it directly in the app.)</li>
   <li>When linked, your <b>TG_SESSION</b> appears below.</li>
 </ol>
 <button id=start>Start QR</button>
-<div id=qrbox><p>Scan with Telegram → Devices:</p><img id=qr src=""><p><a id=deeplink href="#" target="_blank">Open in Telegram</a></p></div>
+<div id=qrbox>
+  <p>Scan with Telegram → Devices (<span id=timer>60</span>s left):</p>
+  <img id=qr src="">
+  <p><a id=deeplink href="#" target="_blank">Open in Telegram</a></p>
+  <p id=hint></p>
+  <button id=refresh style="margin-top:8px">Refresh QR</button>
+</div>
 <h3>Session</h3>
 <pre id=out>(waiting…)</pre>
 <script>
-let id='', refreshTimer=null, pollTimer=null, expiresAt=0;
+let id='', pollTimer=null, countdown=null, expiresAt=0;
 const $=(x)=>document.getElementById(x);
+
 async function start(){
-  clearInterval(refreshTimer); clearTimeout(pollTimer);
+  clearTimeout(pollTimer); clearInterval(countdown);
   $('out').textContent='(waiting…)';
+  $('hint').textContent='';
   const r = await fetch('/api/tg/qr/start');
   const d = await r.json();
   if(d.error){ $('out').textContent='Error: '+d.error; return; }
@@ -309,19 +319,27 @@ async function start(){
   $('deeplink').href = url;
   $('qrbox').style.display='block';
   const ttl = (d.expiresInSec ?? 60) * 1000;
-  expiresAt = Date.now() + ttl - 5000;
-  refreshTimer = setInterval(()=>{ if(Date.now()>expiresAt){ start(); } }, 1000);
+  expiresAt = Date.now() + ttl;
+  updateTimer(); countdown = setInterval(updateTimer, 1000);
   poll();
 }
 $('start').onclick = start;
+$('refresh').onclick = start;
+
+function updateTimer(){
+  const left = Math.max(0, Math.ceil((expiresAt - Date.now())/1000));
+  $('timer').textContent = left;
+  if(left === 0){ $('hint').textContent = 'QR expired. Click "Refresh QR" and scan again.'; }
+}
 
 async function poll(){
   const r = await fetch('/api/tg/qr/poll', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ id }) });
   const d = await r.json();
   if(d.error){ $('out').textContent='Error: '+d.error; return; }
-  if(d.session){ $('out').textContent = d.session; clearInterval(refreshTimer); return; }
-  if(d.status==='EXPIRED'){ $('out').textContent='QR expired. Restarting…'; return start(); }
-  pollTimer = setTimeout(poll, 800);
+  if(d.session){ $('out').textContent = d.session; clearInterval(countdown); return; }
+  if(d.status==='EXPIRED'){ $('hint').textContent='QR expired. Click "Refresh QR".'; return; }
+  // WAITING
+  pollTimer = setTimeout(poll, 900);
 }
 </script>`);
   });
@@ -348,7 +366,7 @@ async function poll(){
       const id = Math.random().toString(36).slice(2);
       QR_STORE.set(id, { client, token: tokenU8, createdAt: Date.now() });
 
-      const deeplink = 'tg://login?token=' + b64url(tokenU8);
+      const deeplink = 'tg://login?token=' + Buffer.from(tokenU8).toString('base64').replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
       res.json({ id, deeplink, expiresInSec: 60 });
     } catch (e: any) {
       res.status(500).json({ error: String(e?.message || e) });
