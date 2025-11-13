@@ -12,9 +12,7 @@ import { Buffer } from 'buffer';
 
 const ERC20_ABI = ['function balanceOf(address) view returns (uint256)'];
 
-// -----------------------------
-// Helpers
-// -----------------------------
+// ---------- helpers ----------
 async function holderGateByWallet(addressToCheck: string) {
   if (!env.HOLDER_TOKEN_ADDRESS) return true;
   const provider = new ethers.JsonRpcProvider(env.EVM_RPC_URL, { chainId: env.CHAIN_ID, name: `chain-${env.CHAIN_ID}` });
@@ -23,7 +21,6 @@ async function holderGateByWallet(addressToCheck: string) {
   return bal >= env.HOLDER_MIN_UNITS;
 }
 
-// URL-safe base64 for binary ids
 function b64urlEncode(u8: Uint8Array) {
   return Buffer.from(u8).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/,'');
 }
@@ -33,16 +30,14 @@ function b64urlDecode(s: string): Uint8Array {
   return new Uint8Array(Buffer.from(std, 'base64'));
 }
 
-// -----------------------------
-// Main
-// -----------------------------
+// ---------- main ----------
 (async function main() {
   await ensureDefaultUser();
 
   const app = express();
   app.use(bodyParser.json());
 
-  // Open (no API key) routes for TG session helpers
+  // Open (no key) endpoints for TG session helpers
   const OPEN_PATHS = new Set<string>([
     '/tg-session',
     '/api/tg/sendCode',
@@ -62,9 +57,7 @@ function b64urlDecode(s: string): Uint8Array {
     next();
   });
 
-  // -----------------------------
-  // Wallet & Profiles
-  // -----------------------------
+  // ---------- wallets & profiles ----------
   app.post('/wallets', async (req: Request, res: Response) => {
     const user = (req as any).user;
     const { address, chainId = env.CHAIN_ID, label } = req.body || {};
@@ -83,6 +76,7 @@ function b64urlDecode(s: string): Uint8Array {
     const wallet = await prisma.wallet.findUnique({ where: { id: walletId } });
     if (!wallet || wallet.userId !== user.id) return res.status(404).json({ error: 'wallet not found' });
     if (!(await holderGateByWallet(wallet.address))) return res.status(402).json({ error: 'holder requirement not met' });
+
     const p = await prisma.buyProfile.create({
       data: {
         userId: user.id,
@@ -94,7 +88,7 @@ function b64urlDecode(s: string): Uint8Array {
         keywords: keywords || 'buy,ca,contract,token,launch,shill,coin',
         router,
         wrappedNative,
-        feeBps: feeBps ?? 100, // 1% default
+        feeBps: feeBps ?? 100,
         treasury: treasury || process.env.TREASURY_ADDRESS || null,
         dryRun: dryRun ?? true
       }
@@ -102,9 +96,7 @@ function b64urlDecode(s: string): Uint8Array {
     res.json(p);
   });
 
-  // -----------------------------
-  // Channels
-  // -----------------------------
+  // ---------- channels ----------
   app.post('/channels', async (req: Request, res: Response) => {
     const user = (req as any).user;
     const { slug, mode, buyProfileId } = req.body || {};
@@ -138,9 +130,7 @@ function b64urlDecode(s: string): Uint8Array {
     res.json(updated);
   });
 
-  // -----------------------------
-  // Dry-run toggle & status
-  // -----------------------------
+  // ---------- dryrun/status ----------
   app.post('/profiles/:id/dryrun', async (req: Request, res: Response) => {
     const user = (req as any).user;
     const id = String(req.params.id);
@@ -167,9 +157,7 @@ function b64urlDecode(s: string): Uint8Array {
     });
   });
 
-  // -----------------------------
-  // Manual trade trigger
-  // -----------------------------
+  // ---------- manual trade ----------
   app.post('/trade/execute', async (req: Request, res: Response) => {
     const user = (req as any).user;
     const { slug, token } = req.body || {};
@@ -181,7 +169,7 @@ function b64urlDecode(s: string): Uint8Array {
   });
 
   // ======================================================
-  // TG SESSION – Code-based page (kept available)
+  // TG SESSION — code login (kept available)
   // ======================================================
   app.get('/tg-session', (_req: Request, res: Response) => {
     res.type('html').send(`
@@ -267,7 +255,7 @@ get('signin').onclick = async ()=>{
   });
 
   // ======================================================
-  // TG SESSION – QR (STATELESS)
+  // TG SESSION — QR (stateless, with DC migration on same client)
   // ======================================================
   app.get('/tg-session-qr', (_req: Request, res: Response) => {
     res.type('html').send(`
@@ -326,7 +314,7 @@ get('refresh').onclick = refresh;
 </script>`);
   });
 
-  // Start: export token, return id = base64url(token)
+  // Start: export token and return id=base64url(token)
   app.get('/api/tg/qr/start', async (_req: Request, res: Response) => {
     try {
       const apiId = Number(process.env.TG_API_ID || 0);
@@ -343,14 +331,14 @@ get('refresh').onclick = refresh;
 
       const tokenU8 = exported.token as Uint8Array;
       const id = b64urlEncode(tokenU8);
-      const deeplink = 'tg://login?token=' + id; // Telegram accepts url-safe b64 token
-      res.json({ id, deeplink, expiresInSec: 60 }); // token is short-lived
+      const deeplink = 'tg://login?token=' + id; // url-safe base64
+      res.json({ id, deeplink, expiresInSec: 60 });
     } catch (e: any) {
       res.status(500).json({ error: String(e?.message || e) });
     }
   });
 
-  // Poll: stateless — recreate client and import token each time
+  // Poll: stateless. Recreate a client, import token, handle DC-migrate on same client.
   app.post('/api/tg/qr/poll', async (req: Request, res: Response) => {
     try {
       const { id } = req.body || {};
@@ -360,55 +348,52 @@ get('refresh').onclick = refresh;
       const apiHash = String(process.env.TG_API_HASH || '');
       if (!apiId || !apiHash) return res.status(500).json({ error: 'TG_API_ID/HASH not set' });
 
-      let token = b64urlDecode(String(id));
+      const token = b64urlDecode(String(id));
 
-      // helper to import with a fresh client (handles DC migration)
-      const importWithClient = async (dcId?: number) => {
-        const client = new TelegramClient(new StringSession(''), apiId, apiHash, { connectionRetries: 5, baseDC: dcId });
-        await client.connect();
-        try {
-          const result: any = await client.invoke(new Api.auth.ImportLoginToken({ token: Buffer.from(token) }));
-          if (result && result.className === 'auth.loginTokenMigrateTo') {
-            const d = result.dcId as number;
-            await client.disconnect();
-            return { migrateTo: d } as const;
-          }
-          if (result && result.className === 'auth.loginTokenSuccess') {
-            const session = client.session.save();
-            await client.disconnect();
-            return { session } as const;
-          }
-          await client.disconnect();
-          return { waiting: true } as const;
-        } catch (e: any) {
+      const client = new TelegramClient(new StringSession(''), apiId, apiHash, { connectionRetries: 5 });
+      await client.connect();
+
+      const importOnce = async () =>
+        await client.invoke(new Api.auth.ImportLoginToken({ token: Buffer.from(token) }));
+
+      let result: any;
+      try {
+        result = await importOnce();
+      } catch (e: any) {
+        const msg = String(e?.message || '');
+        if (msg.includes('AUTH_TOKEN_EXPIRED')) { try { await client.disconnect(); } catch {} ; return res.json({ status: 'EXPIRED' }); }
+        if (msg.includes('AUTH_TOKEN_INVALID')) { try { await client.disconnect(); } catch {} ; return res.json({ status: 'WAITING' }); }
+        try { await client.disconnect(); } catch {}
+        return res.status(500).json({ error: msg });
+      }
+
+      // DC migrate hint -> switch DC on same client and retry once
+      if (result && result.className === 'auth.loginTokenMigrateTo') {
+        const dcId = (result as any).dcId as number;
+        try { await (client as any)._switchDC(dcId); } catch {}
+        try { result = await importOnce(); } catch (e: any) {
           const msg = String(e?.message || '');
-          await client.disconnect();
-          if (msg.includes('AUTH_TOKEN_EXPIRED')) return { expired: true } as const;
-          if (msg.includes('AUTH_TOKEN_INVALID')) return { waiting: true } as const; // not yet accepted
-          return { error: msg } as const;
+          if (msg.includes('AUTH_TOKEN_EXPIRED')) { try { await client.disconnect(); } catch {} ; return res.json({ status: 'EXPIRED' }); }
+          if (msg.includes('AUTH_TOKEN_INVALID')) { try { await client.disconnect(); } catch {} ; return res.json({ status: 'WAITING' }); }
+          try { await client.disconnect(); } catch {}
+          return res.status(500).json({ error: msg });
         }
-      };
+      }
 
-      // First try
-      let r = await importWithClient();
+      if (result && result.className === 'auth.loginTokenSuccess') {
+        const session = client.session.save();
+        try { await client.disconnect(); } catch {}
+        return res.json({ session });
+      }
 
-      // If DC migrate hint, try once on that DC
-      if ('migrateTo' in r) r = await importWithClient(r.migrateTo);
-
-      if ('session' in r) return res.json({ session: r.session });
-      if ('expired' in r && r.expired) return res.json({ status: 'EXPIRED' });
-      if ('waiting' in r && r.waiting) return res.json({ status: 'WAITING' });
-      if ('error' in r) return res.status(500).json({ error: r.error });
-
-      // Fallback
+      // Not accepted yet
+      try { await client.disconnect(); } catch {}
       return res.json({ status: 'WAITING' });
     } catch (e: any) {
       res.status(500).json({ error: String(e?.message || e) });
     }
   });
 
-  // -----------------------------
-  // Boot
-  // -----------------------------
+  // ---------- boot ----------
   app.listen(env.PORT, () => console.log(`API up on :${env.PORT}`));
 })();
