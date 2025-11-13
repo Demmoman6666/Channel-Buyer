@@ -11,7 +11,6 @@ import { Buffer } from 'buffer';
 
 const ERC20_ABI = ['function balanceOf(address) view returns (uint256)'];
 
-/* -------------------- holder gate -------------------- */
 async function holderGateByWallet(addressToCheck: string) {
   if (!env.HOLDER_TOKEN_ADDRESS) return true;
   const provider = new ethers.JsonRpcProvider(env.EVM_RPC_URL, { chainId: env.CHAIN_ID, name: `chain-${env.CHAIN_ID}` });
@@ -20,32 +19,30 @@ async function holderGateByWallet(addressToCheck: string) {
   return bal >= env.HOLDER_MIN_UNITS;
 }
 
-/* -------------------- boot -------------------- */
 (async function main() {
   await ensureDefaultUser();
 
   const app = express();
   app.use(bodyParser.json());
 
-  /* ---------- auth (allow QR helpers open) ---------- */
-  const OPEN_PATHS = new Set<string>([
+  // Public paths (no API key): TG session helpers
+  const OPEN_PATHS = new Set([
     '/tg-session', '/api/tg/sendCode', '/api/tg/signIn',
     '/tg-session-qr', '/api/tg/qr/start', '/api/tg/qr/poll'
   ]);
 
+  // API key auth for everything else
   app.use(async (req: Request, res: Response, next: NextFunction) => {
     if (OPEN_PATHS.has(req.path)) return next();
-
     const key = String((req.headers['x-api-key'] as string) || (req.query.api_key as string) || '');
     if (!key || key !== env.API_KEY) return res.status(401).json({ error: 'unauthorized' });
-
     const user = await prisma.user.findUnique({ where: { apiKey: env.API_KEY } });
     (req as any).user = user;
     next();
   });
 
-  /* -------------------- wallets & profiles -------------------- */
-  app.post('/wallets', async (req: Request, res: Response) => {
+  // ---- Wallets / Profiles / Channels / Status ----
+  app.post('/wallets', async (req, res) => {
     const user = (req as any).user;
     const { address, chainId = env.CHAIN_ID, label } = req.body || {};
     if (!address) return res.status(400).json({ error: 'address required' });
@@ -54,7 +51,7 @@ async function holderGateByWallet(addressToCheck: string) {
     res.json(w);
   });
 
-  app.post('/profiles', async (req: Request, res: Response) => {
+  app.post('/profiles', async (req, res) => {
     const user = (req as any).user;
     const { walletId, amountNative, slippageBps, denyWords, keywords, router, wrappedNative, feeBps, treasury, dryRun } = req.body || {};
     if (!walletId || amountNative == null || !slippageBps || !router || !wrappedNative) {
@@ -75,7 +72,7 @@ async function holderGateByWallet(addressToCheck: string) {
         keywords: keywords || 'buy,ca,contract,token,launch,shill,coin',
         router,
         wrappedNative,
-        feeBps: feeBps ?? 100, // 1%
+        feeBps: feeBps ?? 100,
         treasury: treasury || process.env.TREASURY_ADDRESS || null,
         dryRun: dryRun ?? true
       }
@@ -83,8 +80,7 @@ async function holderGateByWallet(addressToCheck: string) {
     res.json(p);
   });
 
-  /* -------------------- channels -------------------- */
-  app.post('/channels', async (req: Request, res: Response) => {
+  app.post('/channels', async (req, res) => {
     const user = (req as any).user;
     const { slug, mode, buyProfileId } = req.body || {};
     if (!slug || !buyProfileId) return res.status(400).json({ error: 'slug and buyProfileId required' });
@@ -101,13 +97,13 @@ async function holderGateByWallet(addressToCheck: string) {
     res.json(ch);
   });
 
-  app.get('/channels/list', async (req: Request, res: Response) => {
+  app.get('/channels/list', async (req, res) => {
     const user = (req as any).user;
     const list = await prisma.channel.findMany({ where: { userId: user.id } });
     res.json(list);
   });
 
-  app.post('/channels/toggleBySlug', async (req: Request, res: Response) => {
+  app.post('/channels/toggleBySlug', async (req, res) => {
     const user = (req as any).user;
     const { slug, active } = req.body || {};
     if (!slug) return res.status(400).json({ error: 'slug required' });
@@ -117,19 +113,19 @@ async function holderGateByWallet(addressToCheck: string) {
     res.json(updated);
   });
 
-  /* -------------------- profile status/toggles -------------------- */
-  app.post('/profiles/:id/dryrun', async (req: Request, res: Response) => {
+  app.post('/profiles/:id/dryrun', async (req, res) => {
     const user = (req as any).user;
     const id = String(req.params.id);
     const { toggle, dryRun } = req.body || {};
     const p = await prisma.buyProfile.findUnique({ where: { id }, include: { wallet: true } });
     if (!p || p.userId !== user.id) return res.status(404).json({ error: 'profile not found' });
+
     const next = toggle ? !p.dryRun : !!dryRun;
     const up = await prisma.buyProfile.update({ where: { id }, data: { dryRun: next } });
     res.json({ dryRun: up.dryRun });
   });
 
-  app.get('/profiles/:id/status', async (req: Request, res: Response) => {
+  app.get('/profiles/:id/status', async (req, res) => {
     const user = (req as any).user;
     const id = String(req.params.id);
     const p = await prisma.buyProfile.findUnique({ where: { id }, include: { wallet: true } });
@@ -144,8 +140,7 @@ async function holderGateByWallet(addressToCheck: string) {
     });
   });
 
-  /* -------------------- manual trade trigger -------------------- */
-  app.post('/trade/execute', async (req: Request, res: Response) => {
+  app.post('/trade/execute', async (req, res) => {
     const user = (req as any).user;
     const { slug, token } = req.body || {};
     if (!slug || !token) return res.status(400).json({ error: 'slug and token required' });
@@ -155,11 +150,10 @@ async function holderGateByWallet(addressToCheck: string) {
     res.json({ result });
   });
 
-  /* ======================================================
-     SIMPLE CODE LOGIN PAGE (still available)
-     ====================================================== */
-  app.get('/tg-session', (_req: Request, res: Response) => {
-    res.type('html').send(`<!doctype html><meta name=viewport content="width=device-width,initial-scale=1"><title>TG Session</title>
+  /* ===== Code login page (optional) ===== */
+  app.get('/tg-session', (_req, res) => {
+    res.type('html').send(`
+<!doctype html><meta name=viewport content="width=device-width,initial-scale=1"><title>TG Session</title>
 <style>body{font-family:system-ui,Arial;margin:20px;max-width:760px}label{display:block;margin:.6rem 0 .2rem}input{width:100%;padding:.5rem}button{margin-top:.8rem;padding:.6rem 1rem}pre{white-space:pre-wrap;background:#f5f5f7;padding:10px;border-radius:8px}</style>
 <h2>Generate Telegram TG_SESSION</h2>
 <label>Phone (e.g. +447...)</label><input id=phone placeholder="+447..." />
@@ -174,19 +168,19 @@ async function holderGateByWallet(addressToCheck: string) {
 let phoneCodeHash = '';
 const $ = (id)=>document.getElementById(id);
 $('send').onclick = async ()=>{
-  const r = await fetch('/api/tg/sendCode', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone:$('phone').value})});
-  const d = await r.json(); if(d.error){$('out').textContent='Error: '+d.error; return;}
+  const r = await fetch('/api/tg/sendCode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone:$('phone').value})});
+  const d = await r.json(); if(d.error){$('out').textContent='Error: '+d.error;return;}
   phoneCodeHash = d.phoneCodeHash; $('codeArea').style.display='block'; $('out').textContent='Code sent. Check Telegram.';
 };
 $('signin').onclick = async ()=>{
-  const r = await fetch('/api/tg/signIn', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone:$('phone').value, code:$('code').value, phoneCodeHash, password:$('pw').value})});
-  const d = await r.json(); if(d.error){$('out').textContent='Error: '+d.error; return;}
+  const r = await fetch('/api/tg/signIn',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone:$('phone').value,code:$('code').value,phoneCodeHash,password:$('pw').value})});
+  const d = await r.json(); if(d.error){$('out').textContent='Error: '+d.error;return;}
   $('out').textContent=d.session || '(no session returned)';
 };
 </script>`);
   });
 
-  app.post('/api/tg/sendCode', async (req: Request, res: Response) => {
+  app.post('/api/tg/sendCode', async (req, res) => {
     try {
       const { phone } = req.body || {};
       if (!phone) return res.status(400).json({ error: 'phone required' });
@@ -204,7 +198,7 @@ $('signin').onclick = async ()=>{
     }
   });
 
-  app.post('/api/tg/signIn', async (req: Request, res: Response) => {
+  app.post('/api/tg/signIn', async (req, res) => {
     try {
       const { phone, code, phoneCodeHash, password } = req.body || {};
       const apiId = Number(process.env.TG_API_ID || 0);
@@ -231,14 +225,11 @@ $('signin').onclick = async ()=>{
     }
   });
 
-  /* ======================================================
-     QR LOGIN (STATELESS; NO SERVER MEMORY)
-     ====================================================== */
+  /* ===== QR login (stateless) ===== */
+  const b64url = (buf: Buffer) =>
+    buf.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 
-  function b64url(u8: Uint8Array) {
-    return Buffer.from(u8).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-  }
-  async function importTokenOnce(tokenU8: Uint8Array) {
+  async function importTokenOnce(tokenBuf: Buffer): Promise<{ status: 'OK'|'WAITING'|'EXPIRED', session?: string }> {
     const apiId = Number(process.env.TG_API_ID || 0);
     const apiHash = String(process.env.TG_API_HASH || '');
     if (!apiId || !apiHash) throw new Error('TG_API_ID/HASH not set');
@@ -248,11 +239,11 @@ $('signin').onclick = async ()=>{
     try {
       let result: any;
       try {
-        result = await client.invoke(new Api.auth.ImportLoginToken({ token: tokenU8 }));
+        result = await client.invoke(new Api.auth.ImportLoginToken({ token: tokenBuf as any }));
       } catch (e: any) {
         const msg = String(e?.message || '');
-        if (msg.includes('AUTH_TOKEN_EXPIRED')) return { status: 'EXPIRED' as const };
-        if (msg.includes('AUTH_TOKEN_INVALID')) return { status: 'WAITING' as const };
+        if (msg.includes('AUTH_TOKEN_EXPIRED')) return { status: 'EXPIRED' };
+        if (msg.includes('AUTH_TOKEN_INVALID')) return { status: 'WAITING' };
         throw e;
       }
 
@@ -261,23 +252,20 @@ $('signin').onclick = async ()=>{
         if (typeof (client as any)._switchDC === 'function') {
           await (client as any)._switchDC(dcId);
         }
-        result = await client.invoke(new Api.auth.ImportLoginToken({ token: tokenU8 }));
+        result = await client.invoke(new Api.auth.ImportLoginToken({ token: tokenBuf as any }));
       }
 
       if (result && result.className === 'auth.loginTokenSuccess') {
         const session = client.session.save();
-        return { status: 'OK' as const, session };
+        return { status: 'OK', session };
       }
-
-      // not accepted yet
-      return { status: 'WAITING' as const };
+      return { status: 'WAITING' };
     } finally {
       try { await client.disconnect(); } catch {}
     }
   }
 
-  // Page
-  app.get('/tg-session-qr', (_req: Request, res: Response) => {
+  app.get('/tg-session-qr', (_req, res) => {
     res.type('html').send(`<!doctype html><meta name=viewport content="width=device-width,initial-scale=1"><title>TG Session (QR)</title>
 <style>
   body{font-family:system-ui,Arial;margin:20px;max-width:760px}
@@ -285,33 +273,30 @@ $('signin').onclick = async ()=>{
   #qrbox{margin-top:12px;display:none}
   #qrbox img{width:240px;height:240px;border:1px solid #ddd;border-radius:8px}
   pre{white-space:pre-wrap;background:#f5f5f7;padding:10px;border-radius:8px}
-  #meta{margin-top:8px;color:#666;font-family:system-ui,Arial;font-size:12px}
 </style>
 <h2>Generate Telegram TG_SESSION (QR login)</h2>
 <ol>
-  <li>Click <b>Start QR</b>. A QR appears.</li>
-  <li>In Telegram: <b>Settings → Devices → Link Desktop Device</b> and scan (or tap <i>Open in Telegram</i> below the QR).</li>
-  <li>When linked, your <b>TG_SESSION</b> prints below — copy it into Railway (Userbot).</li>
+  <li>Click <b>Start QR</b>.</li>
+  <li>On phone: <b>Telegram → Settings → Devices → Link Desktop Device</b> (or tap <i>Open in Telegram</i>).</li>
+  <li>When linked, your <b>TG_SESSION</b> prints below.</li>
 </ol>
 <button id=start>Start QR</button><button id=refresh style="display:none">Refresh QR</button>
 <div id=qrbox>
   <p>Scan with Telegram → Devices:</p>
   <img id=qr src="">
   <p><a id=deeplink href="#" target="_blank">Open in Telegram</a></p>
-  <div id=meta></div>
 </div>
 <h3>Session</h3>
 <pre id=out>(waiting…)</pre>
 <script>
 let tokenB64 = '';
-let stop = false;
-
+let stopped = false;
 const $ = (id)=>document.getElementById(id);
 const drawQR = (url)=> $('qr').src = 'https://api.qrserver.com/v1/create-qr-code/?size=240x240&data='+encodeURIComponent(url);
 
 async function startQR(){
   $('out').textContent='(waiting…)';
-  stop = false;
+  stopped = false;
   const r = await fetch('/api/tg/qr/start'); const d = await r.json();
   if(d.error){ $('out').textContent='Error: '+d.error; return; }
   tokenB64 = d.tokenB64;
@@ -320,16 +305,15 @@ async function startQR(){
   drawQR(url);
   $('qrbox').style.display='block';
   $('refresh').style.display='inline-block';
-  $('meta').textContent = 'Token TTL ~30–60s. If it expires, press Refresh QR.';
   poll();
 }
 
 async function poll(){
-  if (stop || !tokenB64) return;
+  if (stopped || !tokenB64) return;
   const r = await fetch('/api/tg/qr/poll', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ tokenB64 }) });
   const d = await r.json();
   if (d.error){ $('out').textContent='Error: '+d.error; return; }
-  if (d.status === 'OK' && d.session){ $('out').textContent = d.session; stop = true; return; }
+  if (d.status === 'OK' && d.session){ $('out').textContent = d.session; stopped = true; return; }
   if (d.status === 'EXPIRED'){ $('out').textContent = 'QR expired. Click "Refresh QR".'; return; }
   setTimeout(poll, 2000);
 }
@@ -339,8 +323,7 @@ $('refresh').onclick = startQR;
 </script>`);
   });
 
-  // Start: export token, return as base64url (no server state kept)
-  app.get('/api/tg/qr/start', async (_req: Request, res: Response) => {
+  app.get('/api/tg/qr/start', async (_req, res) => {
     try {
       const apiId = Number(process.env.TG_API_ID || 0);
       const apiHash = String(process.env.TG_API_HASH || '');
@@ -350,28 +333,28 @@ $('refresh').onclick = startQR;
       await client.connect();
       const exported: any = await client.invoke(new Api.auth.ExportLoginToken({ apiId, apiHash, exceptIds: [] }));
       try { await client.disconnect(); } catch {}
-      const raw = exported?.token as Uint8Array;
-      if (!raw) return res.status(500).json({ error: 'Failed to export login token' });
 
-      return res.json({ tokenB64: b64url(raw) });
+      const raw = exported?.token as Buffer | Uint8Array;
+      if (!raw) return res.status(500).json({ error: 'Failed to export login token' });
+      const tokBuf: Buffer = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
+
+      return res.json({ tokenB64: b64url(tokBuf) });
     } catch (e: any) {
       res.status(500).json({ error: String(e?.message || e) });
     }
   });
 
-  // Poll: take token from client, try to import on-the-fly
-  app.post('/api/tg/qr/poll', async (req: Request, res: Response) => {
+  app.post('/api/tg/qr/poll', async (req, res) => {
     try {
       const { tokenB64 } = req.body || {};
       if (!tokenB64) return res.status(400).json({ error: 'tokenB64 required' });
-      const u8 = new Uint8Array(Buffer.from(String(tokenB64).replace(/-/g, '+').replace(/_/g, '/'), 'base64'));
-      const out = await importTokenOnce(u8);
+      const tokBuf = Buffer.from(String(tokenB64).replace(/-/g, '+').replace(/_/g, '/'), 'base64');
+      const out = await importTokenOnce(tokBuf);
       res.json(out);
     } catch (e: any) {
       res.status(500).json({ error: String(e?.message || e) });
     }
   });
 
-  /* -------------------- boot -------------------- */
   app.listen(env.PORT, () => console.log(`API up on :${env.PORT}`));
 })();
