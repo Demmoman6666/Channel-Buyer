@@ -26,7 +26,7 @@ async function holderGateByWallet(addressToCheck: string) {
   app.use(bodyParser.json());
 
   // -----------------------------
-  // Auth with allowlist (code + QR helpers are open)
+  // Auth allowlist (public helper pages are open)
   // -----------------------------
   const OPEN_PATHS = new Set<string>([
     '/tg-session',
@@ -35,14 +35,13 @@ async function holderGateByWallet(addressToCheck: string) {
     '/tg-session-qr',
     '/api/tg/qr/start',
     '/api/tg/qr/poll',
+    '/api/tg/qr/debug',
   ]);
 
   app.use(async (req: Request, res: Response, next: NextFunction) => {
     if (OPEN_PATHS.has(req.path)) return next();
-
     const key = String((req.headers['x-api-key'] as string) || (req.query.api_key as string) || '');
     if (!key || key !== env.API_KEY) return res.status(401).json({ error: 'unauthorized' });
-
     const user = await prisma.user.findUnique({ where: { apiKey: env.API_KEY } });
     (req as any).user = user;
     next();
@@ -81,10 +80,10 @@ async function holderGateByWallet(addressToCheck: string) {
         keywords: keywords || 'buy,ca,contract,token,launch,shill,coin',
         router,
         wrappedNative,
-        feeBps: feeBps ?? 100, // 1% fee default
+        feeBps: feeBps ?? 100, // 1%
         treasury: treasury || process.env.TREASURY_ADDRESS || null,
-        dryRun: dryRun ?? true
-      }
+        dryRun: dryRun ?? true,
+      },
     });
     res.json(p);
   });
@@ -111,7 +110,7 @@ async function holderGateByWallet(addressToCheck: string) {
 
   app.get('/channels/list', async (req: Request, res: Response) => {
     const user = (req as any).user;
-    const list = await prisma.channel.findMany({ where: { userId: user?.id } });
+    const list = await prisma.channel.findMany({ where: { userId: user.id } });
     res.json(list);
   });
 
@@ -134,7 +133,6 @@ async function holderGateByWallet(addressToCheck: string) {
     const { toggle, dryRun } = req.body || {};
     const p = await prisma.buyProfile.findUnique({ where: { id }, include: { wallet: true } });
     if (!p || p.userId !== user.id) return res.status(404).json({ error: 'profile not found' });
-
     const next = toggle ? !p.dryRun : !!dryRun;
     const up = await prisma.buyProfile.update({ where: { id }, data: { dryRun: next } });
     res.json({ dryRun: up.dryRun });
@@ -151,7 +149,7 @@ async function holderGateByWallet(addressToCheck: string) {
       slippageBps: p.slippageBps,
       dryRun: p.dryRun,
       feeBps: p.feeBps,
-      treasury: p.treasury
+      treasury: p.treasury,
     });
   });
 
@@ -244,7 +242,7 @@ get('signin').onclick = async ()=>{
       } catch (err: any) {
         if (String(err?.message || '').includes('SESSION_PASSWORD_NEEDED')) {
           if (!password) throw new Error('2FA enabled: supply password');
-          await (client as any).checkPassword(password); // helper not typed
+          await (client as any).checkPassword(password);
         } else {
           throw err;
         }
@@ -258,22 +256,36 @@ get('signin').onclick = async ()=>{
   });
 
   // ======================================================
-  // TG SESSION via QR (no auto-refresh; clear statuses)
+  // TG SESSION via QR — robust polling + debug
   // ======================================================
-
   type QrState = {
     client: TelegramClient;
     token: Uint8Array;
     createdAt: number;
+    lastResult?: string;
+    lastError?: string;
+    polls: number;
   };
+
   const QR_STORE = new Map<string, QrState>();
-  const QR_TTL_MS = 65_000; // Telegram tokens live ~60s
+  const QR_TTL_MS = 65_000; // tokens are ~60s
 
   function b64url(u8: Uint8Array) {
     return Buffer.from(u8).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
   }
 
-  // QR page (stable — you control refresh)
+  async function alreadyAuthorized(state: QrState): Promise<string | null> {
+    try {
+      await state.client.getMe(); // throws if not authorized
+      const session = state.client.session.save();
+      try { await state.client.disconnect(); } catch {}
+      return session || null;
+    } catch {
+      return null;
+    }
+  }
+
+  // QR page
   app.get('/tg-session-qr', (_req: Request, res: Response) => {
     res.type('html').send(`
 <!doctype html><meta name=viewport content="width=device-width,initial-scale=1"><title>TG Session (QR)</title>
@@ -288,8 +300,8 @@ get('signin').onclick = async ()=>{
 <h2>Generate Telegram TG_SESSION (QR login)</h2>
 <ol>
   <li>Click <b>Start QR</b>. A QR appears.</li>
-  <li>On your phone open <b>Telegram → Settings → Devices → Link Desktop Device</b> and scan.<br>
-      (Or tap <i>Open in Telegram</i> to trigger it directly in the app.)</li>
+  <li>On your phone open Telegram → <b>Settings → Devices → Link Desktop Device</b> and scan.<br>
+      (Or tap <b>Open in Telegram</b> to trigger the login inside the app.)</li>
   <li>When linked, your <b>TG_SESSION</b> appears below.</li>
 </ol>
 <button id=start>Start QR</button>
@@ -338,13 +350,16 @@ async function poll(){
   if(d.error){ $('out').textContent='Error: '+d.error; return; }
   if(d.session){ $('out').textContent = d.session; clearInterval(countdown); return; }
   if(d.status==='EXPIRED'){ $('hint').textContent='QR expired. Click "Refresh QR".'; return; }
-  // WAITING
+  // WAITING: show debug crumbs if present
+  if(d.lastResult || d.lastError){
+    $('hint').textContent = (d.lastResult ? ('result: '+d.lastResult+' ') : '') + (d.lastError ? ('err: '+d.lastError) : '');
+  }
   pollTimer = setTimeout(poll, 900);
 }
 </script>`);
   });
 
-  // Start QR login
+  // Start QR
   app.get('/api/tg/qr/start', async (_req: Request, res: Response) => {
     try {
       const apiId = Number(process.env.TG_API_ID || 0);
@@ -364,78 +379,102 @@ async function poll(){
       const tokenU8 = raw instanceof Uint8Array ? raw : new Uint8Array(raw);
 
       const id = Math.random().toString(36).slice(2);
-      QR_STORE.set(id, { client, token: tokenU8, createdAt: Date.now() });
-
-      const deeplink = 'tg://login?token=' + Buffer.from(tokenU8).toString('base64').replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+      QR_STORE.set(id, { client, token: tokenU8, createdAt: Date.now(), polls: 0 });
+      const deeplink = 'tg://login?token=' + b64url(tokenU8);
       res.json({ id, deeplink, expiresInSec: 60 });
     } catch (e: any) {
       res.status(500).json({ error: String(e?.message || e) });
     }
   });
 
-  // Poll QR — handles DC migrate + token expiry gracefully
+  // Poll QR
   app.post('/api/tg/qr/poll', async (req: Request, res: Response) => {
     try {
       const { id } = req.body || {};
       const state = QR_STORE.get(String(id));
       if (!state) return res.json({ status: 'EXPIRED' });
 
+      state.polls++;
+
+      // If token window passed: maybe already authorized?
       if (Date.now() - state.createdAt > QR_TTL_MS) {
+        const sess = await alreadyAuthorized(state);
+        if (sess) { QR_STORE.delete(String(id)); return res.json({ session: sess }); }
         try { await state.client.disconnect(); } catch {}
         QR_STORE.delete(String(id));
-        return res.json({ status: 'EXPIRED' });
+        return res.json({ status: 'EXPIRED', lastResult: state.lastResult, lastError: state.lastError });
       }
 
-      let result: any;
+      // First try: if already authorized, return session
+      const sessPre = await alreadyAuthorized(state);
+      if (sessPre) { QR_STORE.delete(String(id)); return res.json({ session: sessPre }); }
+
+      // Otherwise try to import the login token
       try {
-        result = await state.client.invoke(
-          new Api.auth.ImportLoginToken({ token: Buffer.from(state.token) })
-        );
-      } catch (e: any) {
-        const msg = String(e?.message || '');
-        if (msg.includes('AUTH_TOKEN_EXPIRED') || msg.includes('AUTH_TOKEN_INVALID')) {
-          try { await state.client.disconnect(); } catch {}
-          QR_STORE.delete(String(id));
-          return res.json({ status: 'EXPIRED' });
-        }
-        throw e;
-      }
+        const result: any = await state.client.invoke(new Api.auth.ImportLoginToken({ token: Buffer.from(state.token) }));
+        state.lastResult = result?.className || 'unknown';
 
-      // Migration? switch DC once and retry
-      if (result && result.className === 'auth.loginTokenMigrateTo') {
-        const dcId = (result as any).dcId;
-        if (typeof (state.client as any)._switchDC === 'function') {
-          await (state.client as any)._switchDC(dcId);
-        } else {
-          await state.client.disconnect();
-          await state.client.connect();
-        }
-        try {
-          result = await state.client.invoke(
-            new Api.auth.ImportLoginToken({ token: Buffer.from(state.token) })
-          );
-        } catch (e: any) {
-          const msg = String(e?.message || '');
-          if (msg.includes('AUTH_TOKEN_EXPIRED') || msg.includes('AUTH_TOKEN_INVALID')) {
+        if (result && result.className === 'auth.loginTokenMigrateTo') {
+          // DC migrate
+          const dcId = (result as any).dcId;
+          if (typeof (state.client as any)._switchDC === 'function') {
+            await (state.client as any)._switchDC(dcId);
+          } else {
+            await state.client.disconnect();
+            await state.client.connect();
+          }
+          // Retry once after migration
+          const retry: any = await state.client.invoke(new Api.auth.ImportLoginToken({ token: Buffer.from(state.token) }));
+          state.lastResult = retry?.className || state.lastResult;
+          if (retry && retry.className === 'auth.loginTokenSuccess') {
+            const session = state.client.session.save();
             try { await state.client.disconnect(); } catch {}
             QR_STORE.delete(String(id));
-            return res.json({ status: 'EXPIRED' });
+            return res.json({ session });
           }
-          throw e;
+          // If still not success, fall through to waiting
         }
-      }
 
-      if (result && result.className === 'auth.loginTokenSuccess') {
-        const session = state.client.session.save();
-        try { await state.client.disconnect(); } catch {}
-        QR_STORE.delete(String(id));
-        return res.json({ session });
-      }
+        if (result && result.className === 'auth.loginTokenSuccess') {
+          const session = state.client.session.save();
+          try { await state.client.disconnect(); } catch {}
+          QR_STORE.delete(String(id));
+          return res.json({ session });
+        }
 
-      return res.json({ status: 'WAITING' });
+        // auth.loginToken = still waiting
+        return res.json({ status: 'WAITING', lastResult: state.lastResult });
+      } catch (e: any) {
+        const msg = String(e?.message || '');
+        state.lastError = msg;
+        if (msg.includes('AUTH_TOKEN_EXPIRED') || msg.includes('AUTH_TOKEN_INVALID')) {
+          const sess = await alreadyAuthorized(state);
+          if (sess) { QR_STORE.delete(String(id)); return res.json({ session: sess }); }
+          try { await state.client.disconnect(); } catch {}
+          QR_STORE.delete(String(id));
+          return res.json({ status: 'EXPIRED', lastError: state.lastError });
+        }
+        // Other errors: keep waiting but report
+        return res.json({ status: 'WAITING', lastError: state.lastError });
+      }
     } catch (e: any) {
       res.status(500).json({ error: String(e?.message || e) });
     }
+  });
+
+  // Optional: raw debug
+  app.get('/api/tg/qr/debug', (req: Request, res: Response) => {
+    const id = String(req.query.id || '');
+    const st = QR_STORE.get(id);
+    if (!st) return res.json({ exists: false });
+    res.json({
+      exists: true,
+      createdAt: st.createdAt,
+      ageMs: Date.now() - st.createdAt,
+      polls: st.polls,
+      lastResult: st.lastResult,
+      lastError: st.lastError,
+    });
   });
 
   // -----------------------------
