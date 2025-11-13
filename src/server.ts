@@ -27,7 +27,7 @@ async function holderGateByWallet(addressToCheck: string) {
 
   // -----------------------------
   // Auth (header OR ?api_key=),
-  // with allowlist for TG session helper routes (code + QR)
+  // allowlist TG session helper routes (code + QR)
   // -----------------------------
   const OPEN_PATHS = new Set<string>([
     '/tg-session',
@@ -155,7 +155,7 @@ async function holderGateByWallet(addressToCheck: string) {
   });
 
   // -----------------------------
-  // Manual trade trigger (used by userbot/control when a CA is seen)
+  // Manual trade trigger
   // -----------------------------
   app.post('/trade/execute', async (req: Request, res: Response) => {
     const user = (req as any).user;
@@ -257,19 +257,19 @@ get('signin').onclick = async ()=>{
   });
 
   // ======================================================
-  // TG SESSION via QR (no codes)
+  // TG SESSION via QR (no codes) — FIXED to use Buffer
   // ======================================================
 
   type QrState = {
     client: TelegramClient;
-    token: Uint8Array;
+    token: Buffer;        // store as Buffer for type-safety
     createdAt: number;
   };
   const QR_STORE = new Map<string, QrState>();
   const QR_TTL_MS = 2 * 60 * 1000; // 2 minutes
 
-  function b64url(u8: Uint8Array) {
-    return Buffer.from(u8).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  function b64url(buf: Buffer) {
+    return buf.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
   }
 
   // HTML page for QR login
@@ -336,10 +336,14 @@ async function poll(){
       const exported: any = await client.invoke(new Api.auth.ExportLoginToken({ apiId, apiHash, exceptIds: [] }));
       if (!exported || !exported.token) { await client.disconnect(); return res.status(500).json({ error: 'Failed to export login token' }); }
 
-      const id = Math.random().toString(36).slice(2);
-      QR_STORE.set(id, { client, token: exported.token as Uint8Array, createdAt: Date.now() });
+      // Ensure Buffer type for token
+      const raw = (exported as any).token;
+      const tokenBuf: Buffer = Buffer.isBuffer(raw) ? raw as Buffer : Buffer.from(raw as Uint8Array);
 
-      const deeplink = 'tg://login?token=' + b64url(exported.token);
+      const id = Math.random().toString(36).slice(2);
+      QR_STORE.set(id, { client, token: tokenBuf, createdAt: Date.now() });
+
+      const deeplink = 'tg://login?token=' + b64url(tokenBuf);
       res.json({ id, deeplink, expiresInSec: 120 });
     } catch (e: any) {
       res.status(500).json({ error: String(e?.message || e) });
@@ -359,7 +363,10 @@ async function poll(){
         return res.json({ status: 'EXPIRED' });
       }
 
-      const result: any = await state.client.invoke(new Api.auth.ImportLoginToken({ token: state.token }));
+      // gramJS accepts Uint8Array; Buffer is a subclass, but cast to be explicit
+      const result: any = await state.client.invoke(new Api.auth.ImportLoginToken({
+        token: new Uint8Array(state.token)
+      }));
 
       if (result && result.className === 'auth.loginTokenMigrateTo') {
         try { await state.client.disconnect(); } catch {}
